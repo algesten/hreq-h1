@@ -152,7 +152,7 @@ impl LimitWrite {
         } else if let Some(limit) = content_length {
             LimitWrite::ContentLength(ContentLengthWrite::new(limit))
         } else {
-            unreachable!("LimitWrite from_headers in a bad place")
+            LimitWrite::NoBody
         }
     }
 

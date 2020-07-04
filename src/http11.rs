@@ -1,6 +1,11 @@
 use super::Error;
+use crate::AsyncRead;
+use futures_util::ready;
+use http::header::{HeaderName, HeaderValue};
 use std::io;
 use std::io::Write;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 // Request headers today vary in size from ~200 bytes to over 2KB.
 // As applications use more cookies and user agents expand features,
@@ -9,7 +14,7 @@ use std::io::Write;
 
 /// Write an http/1.1 request to a buffer.
 #[allow(clippy::write_with_newline)]
-pub fn write_http11_req<X>(req: &http::Request<X>, buf: &mut [u8]) -> Result<usize, Error> {
+pub fn write_http11_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
 
@@ -112,7 +117,7 @@ pub fn write_http11_res<X>(req: &http::Response<X>, buf: &mut [u8]) -> Result<us
 }
 
 /// Attempt to parse an http/1.1 response.
-pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, Error> {
+pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, io::Error> {
     if log_enabled!(log::Level::Trace) {
         trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
     }
@@ -120,7 +125,10 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut parser = httparse::Response::new(&mut headers);
 
-    let status = parser.parse(&buf)?;
+    let status = parser
+        .parse(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     if status.is_partial() {
         return Ok(None);
     }
@@ -132,8 +140,8 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
     }
 
     for head in parser.headers.iter() {
-        let name = http::header::HeaderName::from_bytes(head.name.as_bytes());
-        let value = http::header::HeaderValue::from_bytes(head.value);
+        let name = HeaderName::from_bytes(head.name.as_bytes());
+        let value = HeaderValue::from_bytes(head.value);
         match (name, value) {
             (Ok(name), Ok(value)) => bld = bld.header(name, value),
             (Err(e), _) => {
@@ -145,7 +153,10 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
         }
     }
 
-    let built = bld.body(())?;
+    let built = bld
+        .body(())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     let len = status.unwrap();
 
     debug!("try_parse_http11 success: {:?}", built);
@@ -205,4 +216,59 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, E
     debug!("try_parse_http11 success: {:?}", built);
 
     Ok(Some((built, len)))
+}
+
+/// Helper to poll for request or response.
+///
+/// It looks out for \r\n\r\n, which indicates the end of the headers and body begins.
+pub fn poll_for_crlfcrlf<S>(cx: &mut Context, buf: &mut Vec<u8>, io: &mut S) -> Poll<io::Result<()>>
+where
+    S: AsyncRead + Unpin,
+{
+    const END_OF_HEADER: &[u8] = &[b'\r', b'\n', b'\r', b'\n'];
+    let mut end_index = 0;
+    let mut buf_index = 0;
+    let mut one = [0_u8; 1];
+
+    // fix so end_index is where it needs to be
+    loop {
+        if buf_index == buf.len() {
+            break;
+        }
+        if buf[buf_index] == END_OF_HEADER[end_index] {
+            end_index += 1;
+        } else if end_index > 0 {
+            end_index = 0;
+        }
+        buf_index += 1;
+    }
+
+    loop {
+        if buf_index == buf.len() {
+            // read one more char
+            let amount = ready!(Pin::new(&mut &mut *io).poll_read(cx, &mut one[..]))?;
+            if amount == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF before complete http11 header",
+                ))
+                .into();
+            }
+            buf.push(one[0]);
+        }
+
+        if buf[buf_index] == END_OF_HEADER[end_index] {
+            end_index += 1;
+        } else if end_index > 0 {
+            end_index = 0;
+        }
+
+        if end_index == END_OF_HEADER.len() {
+            // we found the end of header sequence
+            break;
+        }
+        buf_index += 1;
+    }
+
+    Ok(()).into()
 }
