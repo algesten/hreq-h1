@@ -8,17 +8,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub(crate) struct Seq(pub u64);
-
-impl Seq {
-    pub fn inc(&mut self) -> Self {
-        let c = *self;
-        self.0 += 1;
-        c
-    }
-}
-
 /// Send some body data to a remote peer.
 ///
 /// Obtained either via a [`client::SendRequest`] or a [`server::SendResponse`].

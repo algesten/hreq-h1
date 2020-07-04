@@ -1,7 +1,6 @@
 use crate::err_closed;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http11_req};
 use crate::limit::{LimitRead, LimitWrite};
-use crate::share::Seq;
 use crate::Error;
 use crate::{AsyncRead, AsyncWrite};
 use crate::{RecvStream, SendStream};
@@ -37,7 +36,6 @@ where
 /// Sender of new requests.
 #[derive(Clone)]
 pub struct SendRequest {
-    next_seq: Seq,
     req_tx: mpsc::Sender<ReqHandle>,
 }
 
@@ -45,7 +43,6 @@ pub struct SendRequest {
 ///
 /// This internally communicates with the `Connection`.
 struct ReqHandle {
-    seq: Seq,
     req: http::Request<()>,
     no_send_body: bool,
     body_rx: mpsc::Receiver<(Vec<u8>, bool)>,
@@ -54,10 +51,7 @@ struct ReqHandle {
 
 impl SendRequest {
     fn new(req_tx: mpsc::Sender<ReqHandle>) -> Self {
-        SendRequest {
-            next_seq: Seq(0),
-            req_tx,
-        }
+        SendRequest { req_tx }
     }
 
     /// Send a new request.
@@ -74,9 +68,6 @@ impl SendRequest {
         req: http::Request<()>,
         end: bool,
     ) -> Result<(ResponseFuture, SendStream), Error> {
-        // Grab sequence number.
-        let seq = self.next_seq.inc();
-
         // Channel to send response back.
         let (res_tx, res_rx) = oneshot::channel();
 
@@ -87,7 +78,6 @@ impl SendRequest {
 
         // The handle for the codec/connection.
         let next = ReqHandle {
-            seq,
             req,
             no_send_body: end,
             body_rx,
@@ -168,13 +158,13 @@ impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             State::Waiting => write!(f, "Waiting")?,
-            State::SendReq(h) => write!(f, "SendReq({:?}): {:?}", h.seq, h.req)?,
+            State::SendReq(h) => write!(f, "SendReq: {:?}", h.req)?,
             State::RecvRes(b) => write!(
                 f,
-                "RecvRes({:?}) done_req_body: {}, done_response: {}",
-                b.handle.seq, b.done_req_body, b.done_response
+                "RecvRes done_req_body: {}, done_response: {}",
+                b.done_req_body, b.done_response
             )?,
-            State::RecvBody(r) => write!(f, "RecvBody({:?})", r.handle.seq)?,
+            State::RecvBody(_) => write!(f, "RecvBody")?,
             State::Empty => write!(f, "Empty")?,
         }
         Ok(())
@@ -332,7 +322,7 @@ where
                 let next = ready!(Pin::new(&mut self.req_rx).poll_next(cx));
 
                 if let Some(h) = next {
-                    trace!("Got next handle: {:?}", h.seq);
+                    trace!("Send next");
                     self.state = State::SendReq(h);
                 } else {
                     // sender has closed, no more requests to come
