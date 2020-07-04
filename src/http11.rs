@@ -1,4 +1,4 @@
-use super::Error;
+use crate::Error;
 use crate::AsyncRead;
 use futures_util::ready;
 use http::header::{HeaderName, HeaderValue};

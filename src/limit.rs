@@ -1,6 +1,6 @@
-use super::chunked::{ChunkedDecoder, ChunkedEncoder};
-use super::AsyncRead;
-use super::Error;
+use crate::chunked::{ChunkedDecoder, ChunkedEncoder};
+use crate::AsyncRead;
+use crate::Error;
 use futures_util::ready;
 use std::fmt;
 use std::io;

@@ -7,6 +7,7 @@ use crate::{RecvStream, SendStream};
 use futures_channel::{mpsc, oneshot};
 use futures_util::ready;
 use futures_util::stream::Stream;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::mem;
@@ -36,13 +37,13 @@ where
 /// Sender of new requests.
 #[derive(Clone)]
 pub struct SendRequest {
-    req_tx: mpsc::Sender<ReqHandle>,
+    req_tx: mpsc::Sender<Handle>,
 }
 
-/// Internal holder of all details for a new request.
+/// Holder of all details for a new request.
 ///
 /// This internally communicates with the `Connection`.
-struct ReqHandle {
+struct Handle {
     req: http::Request<()>,
     no_send_body: bool,
     body_rx: mpsc::Receiver<(Vec<u8>, bool)>,
@@ -50,7 +51,7 @@ struct ReqHandle {
 }
 
 impl SendRequest {
-    fn new(req_tx: mpsc::Sender<ReqHandle>) -> Self {
+    fn new(req_tx: mpsc::Sender<Handle>) -> Self {
         SendRequest { req_tx }
     }
 
@@ -77,7 +78,7 @@ impl SendRequest {
         let limit = LimitWrite::from_headers(req.headers());
 
         // The handle for the codec/connection.
-        let next = ReqHandle {
+        let next = Handle {
             req,
             no_send_body: end,
             body_rx,
@@ -134,7 +135,7 @@ where
 
 struct Codec<S> {
     io: S,
-    req_rx: mpsc::Receiver<ReqHandle>,
+    req_rx: mpsc::Receiver<Handle>,
     to_write: Vec<u8>,
     state: State,
 }
@@ -143,7 +144,7 @@ enum State {
     /// Waiting for the next request.
     Waiting,
     /// Send request.
-    SendReq(ReqHandle),
+    SendReq(Handle),
     /// Receive response and (if appropriate), send request body.
     RecvRes(Bidirect),
     /// Receive response body.
@@ -152,28 +153,9 @@ enum State {
     Empty,
 }
 
-use std::fmt;
-
-impl fmt::Debug for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            State::Waiting => write!(f, "Waiting")?,
-            State::SendReq(h) => write!(f, "SendReq: {:?}", h.req)?,
-            State::RecvRes(b) => write!(
-                f,
-                "RecvRes done_req_body: {}, done_response: {}",
-                b.done_req_body, b.done_response
-            )?,
-            State::RecvBody(_) => write!(f, "RecvBody")?,
-            State::Empty => write!(f, "Empty")?,
-        }
-        Ok(())
-    }
-}
-
 impl State {
     /// Take the ReqHandle from the state, leave placeholder State::Empty in place.
-    fn take_handle(&mut self) -> ReqHandle {
+    fn take_handle(&mut self) -> Handle {
         // Replace reference with placeholder.
         let state = mem::replace(self, State::Empty);
 
@@ -185,11 +167,45 @@ impl State {
             _ => panic!("take_handle in incorrect state"),
         }
     }
+
+    /// "bubble" an error to API side.
+    ///
+    /// Depending on state the io error will surface in different places. If
+    /// the client is waiting on a FutureResponse, it can go there, or if
+    /// the client reading a RecvStream (request body), it can go there.
+    fn propagate_error(self, error: io::Error) {
+        match self {
+            State::SendReq(mut h) => {
+                if let Some(res_tx) = h.res_tx.take() {
+                    res_tx.send(Err(error)).ok();
+                }
+            }
+            State::RecvRes(mut b) => {
+                if let Some(res_tx) = b.handle.res_tx.take() {
+                    res_tx.send(Err(error)).ok();
+                } else if let Some((mut tx_body, _)) = b.holder.take() {
+                    if let Err(_) = tx_body.try_send(Err(error)) {
+                        // best effort, and it failed, not much to do. the
+                        // error still surfaces in the Connection
+                        debug!("Failed to notify RecvStream about error");
+                    }
+                }
+            }
+            State::RecvBody(mut r) => {
+                if let Err(_) = r.tx_body.try_send(Err(error)) {
+                    // best effort, and it failed, not much to do. the
+                    // error still surfaces in the Connection
+                    debug!("Failed to notify RecvStream about error");
+                }
+            }
+            State::Waiting | State::Empty => {}
+        }
+    }
 }
 
 /// Bidirection state. Receive response as well as send request body (if appropriate).
 struct Bidirect {
-    handle: ReqHandle,
+    handle: Handle,
     /// If we are finished sending request body.
     done_req_body: bool,
     /// If we are finished receiving the response.
@@ -203,7 +219,7 @@ struct Bidirect {
 
 /// Receiver of response body.
 struct BodyReceiver {
-    handle: ReqHandle,
+    handle: Handle,
     limit: LimitRead,
     tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
     recv_buf: Vec<u8>,
@@ -213,7 +229,7 @@ impl<S> Codec<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(io: S, req_rx: mpsc::Receiver<ReqHandle>) -> Self {
+    fn new(io: S, req_rx: mpsc::Receiver<Handle>) -> Self {
         Codec {
             io,
             req_rx,
@@ -242,29 +258,9 @@ where
                     // clone the error to be sent API side.
                     let clone = io::Error::new(e.kind(), format!("{}", e));
 
-                    // In some states we can "bubble" the error to API side.
-                    match &mut self.state {
-                        State::SendReq(h) => {
-                            if let Some(res_tx) = h.res_tx.take() {
-                                res_tx.send(Err(clone)).ok();
-                            }
-                        }
-                        State::RecvRes(b) => {
-                            if let Some(res_tx) = b.handle.res_tx.take() {
-                                res_tx.send(Err(clone)).ok();
-                            } else if let Some((mut tx_body, _)) = b.holder.take() {
-                                if let Err(_) = tx_body.try_send(Err(clone)) {
-                                    debug!("Failed to notify RecvStream about error");
-                                }
-                            }
-                        }
-                        State::RecvBody(r) => {
-                            if let Err(_) = r.tx_body.try_send(Err(clone)) {
-                                debug!("Failed to notify RecvStream about error");
-                            }
-                        }
-                        State::Waiting | State::Empty => {}
-                    }
+                    // try propagate the error to the client side.
+                    let state = mem::replace(&mut self.state, State::Empty);
+                    state.propagate_error(clone);
 
                     // the actual error goes to the connection.
                     return Err(e).into();
@@ -485,5 +481,22 @@ where
         }
 
         Ok(true).into()
+    }
+}
+
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Waiting => write!(f, "Waiting")?,
+            State::SendReq(h) => write!(f, "SendReq: {:?}", h.req)?,
+            State::RecvRes(b) => write!(
+                f,
+                "RecvRes done_req_body: {}, done_response: {}",
+                b.done_req_body, b.done_response
+            )?,
+            State::RecvBody(_) => write!(f, "RecvBody")?,
+            State::Empty => write!(f, "Empty")?,
+        }
+        Ok(())
     }
 }
