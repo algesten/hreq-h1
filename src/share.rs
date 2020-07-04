@@ -1,11 +1,15 @@
 use crate::limit::LimitWrite;
+use crate::server::Codec;
+use crate::server::ServerDrive;
 use crate::Error;
 use futures_channel::mpsc;
 use futures_util::future::poll_fn;
 use futures_util::ready;
 use futures_util::stream::Stream;
+use std::fmt;
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 /// Send some body data to a remote peer.
@@ -15,21 +19,26 @@ use std::task::{Context, Poll};
 /// [`client::SendRequest`]: client/struct.SendRequest.html
 /// [`server::SendResponse`]: server/struct.SendResponse.html
 pub struct SendStream {
+    tx_body: mpsc::Sender<(Vec<u8>, bool)>,
     limit: LimitWrite,
-    body_tx: mpsc::Sender<(Vec<u8>, bool)>,
     ended: bool,
+    // used in RecvStream originating in server to drive the connection
+    // from the RecvStream polling itelf.
+    server_inner: Option<Arc<Mutex<Codec>>>,
 }
 
 impl SendStream {
     pub(crate) fn new(
-        body_tx: mpsc::Sender<(Vec<u8>, bool)>,
+        tx_body: mpsc::Sender<(Vec<u8>, bool)>,
         limit: LimitWrite,
         ended: bool,
+        server_inner: Option<Arc<Mutex<Codec>>>,
     ) -> Self {
         SendStream {
-            body_tx,
+            tx_body,
             limit,
             ended,
+            server_inner,
         }
     }
 
@@ -37,7 +46,12 @@ impl SendStream {
     pub fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
-        ready!(Pin::new(&mut this.body_tx).poll_ready(cx))
+        // must drive the connection if server.
+        if let Some(server_inner) = &this.server_inner {
+            server_inner.poll_drive_external(cx)?;
+        }
+
+        ready!(Pin::new(&mut this.tx_body).poll_ready(cx))
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
 
         Ok(()).into()
@@ -53,31 +67,42 @@ impl SendStream {
 
     /// Send some body data.
     ///
-    /// The data is enqueued to be sent without checking whether there is already data
-    /// being handled not yet sent to the remote side. This could lead to holding lots
-    /// of data in memory. To avoid that, use `ready()` to be notified when the previous
-    /// `send_data()` call is finished transfering.
-    ///
     /// `end` controls whether this is the last body chunk to send. It's an error
     /// to send more data after `end` is `true`.
-    pub fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
-        if self.ended {
-            return Err(Error::User("Body data is not expected".into()));
+    pub fn poll_send_data(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        data: &[u8],
+        end: bool,
+    ) -> Poll<Result<(), Error>> {
+        let this = self.get_mut();
+
+        if this.ended {
+            return Err(Error::User("Body data is not expected".into())).into();
         }
 
-        let mut chunk = Vec::with_capacity(data.len() + self.limit.overhead());
-        self.limit.write(data, &mut chunk)?;
+        // must drive the connection if server.
+        if let Some(server_inner) = &this.server_inner {
+            server_inner.poll_drive_external(cx)?;
+        }
+
+        let mut chunk = Vec::with_capacity(data.len() + this.limit.overhead());
+        this.limit.write(data, &mut chunk)?;
 
         if end {
-            self.ended = true;
-            self.limit.finish(&mut chunk)?;
+            this.ended = true;
+            this.limit.finish(&mut chunk)?;
         }
 
-        self.body_tx
+        this.tx_body
             .start_send((chunk, end))
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
 
-        Ok(())
+        Ok(()).into()
+    }
+
+    pub async fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await
     }
 }
 
@@ -91,14 +116,21 @@ pub struct RecvStream {
     rx_body: mpsc::Receiver<io::Result<Vec<u8>>>,
     ready: Option<Vec<u8>>,
     index: usize,
+    // used in RecvStream originating in server to drive the connection
+    // from the RecvStream polling itelf.
+    server_inner: Option<Arc<Mutex<Codec>>>,
 }
 
 impl RecvStream {
-    pub(crate) fn new(rx_body: mpsc::Receiver<io::Result<Vec<u8>>>) -> Self {
+    pub(crate) fn new(
+        rx_body: mpsc::Receiver<io::Result<Vec<u8>>>,
+        server_inner: Option<Arc<Mutex<Codec>>>,
+    ) -> Self {
         RecvStream {
             rx_body,
             ready: None,
             index: 0,
+            server_inner,
         }
     }
 
@@ -109,6 +141,11 @@ impl RecvStream {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+
+        // must drive the connection if server.
+        if let Some(server_inner) = &this.server_inner {
+            server_inner.poll_drive_external(cx)?;
+        }
 
         loop {
             // First ship out ready data already received.
@@ -156,13 +193,14 @@ impl RecvStream {
     }
 }
 
-//                Ready  <--------
-//                  |            |
-//                  v            |
-//             Bidirection       |
-//               /     \         |
-//              v       v        |
-//         RecvBody    Waiting   |
-//               \     /         |
-//                v   v          |
-//               SendBody --------
+impl fmt::Debug for SendStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SendStream")
+    }
+}
+
+impl fmt::Debug for RecvStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RecvStream")
+    }
+}

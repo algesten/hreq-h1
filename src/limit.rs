@@ -165,6 +165,13 @@ impl LimitWrite {
         }
     }
 
+    pub fn is_no_body(&self) -> bool {
+        if let LimitWrite::NoBody = self {
+            return true;
+        }
+        false
+    }
+
     /// Write some data using this limiter.
     pub fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         match self {

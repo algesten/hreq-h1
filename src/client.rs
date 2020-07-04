@@ -46,7 +46,7 @@ pub struct SendRequest {
 struct Handle {
     req: http::Request<()>,
     no_send_body: bool,
-    body_rx: mpsc::Receiver<(Vec<u8>, bool)>,
+    rx_body: mpsc::Receiver<(Vec<u8>, bool)>,
     res_tx: Option<oneshot::Sender<io::Result<http::Response<RecvStream>>>>,
 }
 
@@ -73,7 +73,7 @@ impl SendRequest {
         let (res_tx, res_rx) = oneshot::channel();
 
         // bounded so we provide backpressure if socket is full.
-        let (body_tx, body_rx) = mpsc::channel(2);
+        let (tx_body, rx_body) = mpsc::channel(2);
 
         let limit = LimitWrite::from_headers(req.headers());
 
@@ -81,7 +81,7 @@ impl SendRequest {
         let next = Handle {
             req,
             no_send_body: end,
-            body_rx,
+            rx_body,
             res_tx: Some(res_tx),
         };
 
@@ -91,7 +91,7 @@ impl SendRequest {
         }
 
         let fut = ResponseFuture(res_rx);
-        let send = SendStream::new(body_tx, limit, end);
+        let send = SendStream::new(tx_body, limit, end, None);
 
         Ok((fut, send))
     }
@@ -351,11 +351,14 @@ where
             }
 
             State::RecvRes(b) => {
+                let mut req_body_pending = false;
+
                 if !b.done_req_body {
                     // Not done sending a request body. Try get a body chunk to send.
-                    match Pin::new(&mut b.handle.body_rx).poll_next(cx) {
+                    match Pin::new(&mut b.handle.rx_body).poll_next(cx) {
                         Poll::Pending => {
-                            // Pending is ok, it means the SendBody
+                            // Pending is ok, it means the SendBody has not sent any chunk.
+                            req_body_pending = true;
                         }
 
                         Poll::Ready(Some((mut chunk, end))) => {
@@ -406,7 +409,7 @@ where
                         Some((tx_body, limit))
                     };
 
-                    let recv = RecvStream::new(rx_body);
+                    let recv = RecvStream::new(rx_body, None);
 
                     let (parts, _) = res.into_parts();
                     let res = http::Response::from_parts(parts, recv);
@@ -439,7 +442,15 @@ where
                         // expect no response body.
                         self.state = State::Waiting;
                     }
+
+                    // loop
+                    return Ok(true).into();
                 }
+
+                // invariant: the only way we can be here is if the request body is
+                //            expected and pending.
+                assert!(req_body_pending);
+                return Poll::Pending;
             }
 
             State::RecvBody(r) => {
@@ -448,6 +459,7 @@ where
                     if let Err(_) = ready!(r.tx_body.poll_ready(cx)) {
                         // Receiver is gone. We continue receving to get
                         // connection in a good state for next request.
+                        trace!("Failed to receive body chunk RecvStream is dropped");
                     }
 
                     let chunk =

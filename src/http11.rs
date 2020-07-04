@@ -1,5 +1,5 @@
-use crate::Error;
 use crate::AsyncRead;
+use crate::Error;
 use futures_util::ready;
 use http::header::{HeaderName, HeaderValue};
 use std::io;
@@ -83,19 +83,19 @@ pub fn write_http11_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
 
 /// Write an http/1.1 response to a buffer.
 #[allow(clippy::write_with_newline)]
-pub fn write_http11_res<X>(req: &http::Response<X>, buf: &mut [u8]) -> Result<usize, Error> {
+pub fn write_http11_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
 
     write!(
         w,
         "HTTP/1.1 {} {}\r\n",
-        req.status().as_u16(),
-        req.status().canonical_reason().unwrap_or("Unknown")
+        res.status().as_u16(),
+        res.status().canonical_reason().unwrap_or("Unknown")
     )?;
 
     // the rest of the headers.
-    for (name, value) in req.headers() {
+    for (name, value) in res.headers() {
         write!(w, "{}: ", name)?;
         w.write_all(value.as_bytes())?;
         write!(w, "\r\n")?;
@@ -165,7 +165,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
 }
 
 /// Attempt to parse an http/1.1 request.
-pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, Error> {
+pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, io::Error> {
     if log_enabled!(log::Level::Trace) {
         trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
     }
@@ -173,7 +173,10 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, E
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut parser = httparse::Request::new(&mut headers);
 
-    let status = parser.parse(&buf)?;
+    let status = parser
+        .parse(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     if status.is_partial() {
         return Ok(None);
     }
@@ -210,7 +213,10 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, E
         }
     }
 
-    let built = bld.body(())?;
+    let built = bld
+        .body(())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     let len = status.unwrap();
 
     debug!("try_parse_http11 success: {:?}", built);
