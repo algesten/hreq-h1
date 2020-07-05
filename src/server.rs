@@ -1,4 +1,4 @@
-use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http11_res};
+use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
 use crate::limit::{LimitRead, LimitWrite};
 use crate::Error;
 use crate::RecvStream;
@@ -340,7 +340,7 @@ impl Codec {
 
                     // invariant: we should be able to write _any_ response.
                     let amount =
-                        write_http11_res(&res, &mut self.to_write).expect("Write http::Response");
+                        write_http1x_res(&res, &mut self.to_write).expect("Write http::Response");
 
                     // invariant: amount must match written buffer length
                     assert_eq!(self.to_write.len(), amount);

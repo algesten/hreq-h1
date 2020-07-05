@@ -69,15 +69,9 @@ impl LimitRead {
             }
         };
 
-        let allow_reuse = if version == http::Version::HTTP_11 {
-            is_keep_alive(headers, true)
-        } else {
-            is_keep_alive(headers, false)
-        };
-
         LimitRead {
             limiter,
-            allow_reuse,
+            allow_reuse: allow_reuse(headers, version),
         }
     }
 
@@ -333,6 +327,14 @@ fn is_chunked(headers: &http::HeaderMap<http::HeaderValue>) -> bool {
         .and_then(|h| h.to_str().ok())
         .map(|h| h.contains("chunked"))
         .unwrap_or(false)
+}
+
+pub fn allow_reuse(headers: &http::HeaderMap<http::HeaderValue>, version: http::Version) -> bool {
+    if version == http::Version::HTTP_11 {
+        is_keep_alive(headers, true)
+    } else {
+        is_keep_alive(headers, false)
+    }
 }
 
 fn is_keep_alive(headers: &http::HeaderMap<http::HeaderValue>, default: bool) -> bool {

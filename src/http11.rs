@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 
 /// Write an http/1.1 request to a buffer.
 #[allow(clippy::write_with_newline)]
-pub fn write_http11_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
+pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
 
@@ -25,7 +25,13 @@ pub fn write_http11_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    write!(w, "{} {} HTTP/1.1\r\n", req.method(), pq)?;
+    let ver = match req.version() {
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_11 => "1.1",
+        _ => panic!("Unsupported http version: {:?}", req.version()),
+    };
+
+    write!(w, "{} {} HTTP/{}\r\n", req.method(), pq, ver)?;
 
     let mut host = None;
     for (name, value) in req.headers() {
@@ -81,15 +87,22 @@ pub fn write_http11_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
     Ok(len)
 }
 
-/// Write an http/1.1 response to a buffer.
+/// Write an http/1.x response to a buffer.
 #[allow(clippy::write_with_newline)]
-pub fn write_http11_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, Error> {
+pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
 
+    let ver = match res.version() {
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_11 => "1.1",
+        _ => panic!("Unsupported http version: {:?}", res.version()),
+    };
+
     write!(
         w,
-        "HTTP/1.1 {} {}\r\n",
+        "HTTP/{} {} {}\r\n",
+        ver,
         res.status().as_u16(),
         res.status().canonical_reason().unwrap_or("Unknown")
     )?;
@@ -116,6 +129,14 @@ pub fn write_http11_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usiz
     Ok(len)
 }
 
+fn version_of(v: Option<u8>) -> http::Version {
+    match v {
+        Some(0) => http::Version::HTTP_10,
+        Some(1) => http::Version::HTTP_11,
+        _ => panic!("Unhandled http version: {:?}", v),
+    }
+}
+
 /// Attempt to parse an http/1.1 response.
 pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, io::Error> {
     if log_enabled!(log::Level::Trace) {
@@ -133,7 +154,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
         return Ok(None);
     }
 
-    let mut bld = http::Response::builder();
+    let mut bld = http::Response::builder().version(version_of(parser.version));
 
     if let Some(code) = parser.code {
         bld = bld.status(code);

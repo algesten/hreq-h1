@@ -1,5 +1,6 @@
 use crate::err_closed;
-use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http11_req};
+use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req};
+use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::Error;
 use crate::{AsyncRead, AsyncWrite};
@@ -221,6 +222,8 @@ struct Bidirect {
     done_response: bool,
     /// Buffer to read response into.
     response_buf: Vec<u8>,
+    /// Whether the response version + headers allow connection reuse.
+    response_allow_reuse: bool,
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
     holder: Option<(mpsc::Sender<io::Result<Vec<u8>>>, LimitRead)>,
@@ -345,7 +348,7 @@ where
                 // prep size.
                 self.to_write.resize(MAX_REQUEST_SIZE, 0);
 
-                let amount = write_http11_req(&h.req, &mut self.to_write)?;
+                let amount = write_http1x_req(&h.req, &mut self.to_write)?;
 
                 // scale down
                 self.to_write.resize(amount, 0);
@@ -361,6 +364,7 @@ where
                     done_req_body,
                     done_response: false,
                     response_buf: vec![],
+                    response_allow_reuse: false,
                     holder: None,
                 });
             }
@@ -411,6 +415,10 @@ where
                     // invariant: poll_for_crlfcrlf should provide a full header and
                     //            try_parse_res should not be able to get a partial response.
                     let (res, size) = res.expect("Parsed partial response");
+
+                    // this is used when there is no response body and we have no limiter to
+                    // decice whether to reuse the connection.
+                    b.response_allow_reuse = allow_reuse(res.headers(), res.version());
 
                     // invariant: all bytes should have been used up
                     assert_eq!(b.response_buf.len(), size);
@@ -483,7 +491,15 @@ where
                         });
                     } else {
                         // expect no response body.
-                        self.state = State::Waiting;
+                        if b.response_allow_reuse {
+                            // we can reuse connection
+                            trace!("Reuse connection");
+                            self.state = State::Waiting;
+                        } else {
+                            // drop connection
+                            trace!("Connection is not reusable");
+                            return Ok(false).into();
+                        }
                     }
 
                     // loop
