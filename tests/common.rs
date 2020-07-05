@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use async_std::net::{TcpListener, TcpStream};
 use futures_io::AsyncRead;
 use futures_util::future::poll_fn;
@@ -8,11 +10,12 @@ use std::io;
 use std::str::FromStr;
 use std::sync::Once;
 
-pub async fn serve_once<F, R>(f: F) -> Result<TcpStream, io::Error>
+pub async fn serve<F, R>(mut f: F) -> Result<Connector, io::Error>
 where
     F: Send + 'static,
-    F: FnOnce(String, TcpStream) -> R,
-    R: Future<Output = Result<TcpStream, Error>> + Send,
+    F: FnMut(String, TcpStream, usize) -> R,
+    R: Future<Output = Result<(TcpStream, bool), Error>>,
+    R: Send,
 {
     setup_logger();
 
@@ -20,24 +23,44 @@ where
     let p = l.local_addr()?.port();
 
     async_std::task::spawn(async move {
+        let mut call_count = 1;
         let (mut tcp, _) = l.accept().await.expect("Accept failed");
 
-        let head = read_header(&mut tcp).await.unwrap();
+        loop {
+            let head = match read_header(&mut tcp).await {
+                Ok(v) => v,
+                Err(_e) => {
+                    // client closed the connection
+                    return;
+                }
+            };
 
-        let todo = async move {
-            let mut tcp = f(head, tcp).await?;
-            tcp.flush().await?;
-            Result::<(), Error>::Ok(())
-        };
+            let fut = f(head, tcp, call_count);
 
-        if let Err(e) = todo.await {
-            panic!("run_one failed: {}", e)
+            let (tcp_ret, again) = fut.await.expect("Handler fail");
+            tcp = tcp_ret;
+
+            tcp.flush().await.expect("Flush fail");
+
+            call_count += 1;
+
+            if !again {
+                break;
+            }
         }
     });
 
     let addr = format!("127.0.0.1:{}", p);
 
-    Ok(TcpStream::connect(addr).await?)
+    Ok(Connector(addr))
+}
+
+pub struct Connector(String);
+
+impl Connector {
+    pub async fn connect(&self) -> Result<TcpStream, Error> {
+        Ok(TcpStream::connect(&self.0).await?)
+    }
 }
 
 pub async fn run<B: AsRef<[u8]>>(

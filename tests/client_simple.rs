@@ -6,13 +6,13 @@ use common::HeaderMapExt;
 
 #[async_std::test]
 async fn request_200_ok() -> Result<(), Error> {
-    let conn = common::serve_once(|head, mut tcp| async move {
+    let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(head, "GET /path HTTP/1.1\r\naccept: */*\r\n\r\n");
 
         let res = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
         tcp.write_all(res).await.unwrap();
 
-        Ok(tcp)
+        Ok((tcp, false))
     })
     .await?;
 
@@ -21,7 +21,7 @@ async fn request_200_ok() -> Result<(), Error> {
         .body("")
         .unwrap();
 
-    let (parts, body) = common::run(conn, req).await?;
+    let (parts, body) = common::run(conn.connect().await?, req).await?;
 
     assert_eq!(parts.status, 200);
     assert_eq!(parts.headers.get_as("content-length"), Some(2));
@@ -33,7 +33,7 @@ async fn request_200_ok() -> Result<(), Error> {
 
 #[async_std::test]
 async fn post_body() -> Result<(), Error> {
-    let conn = common::serve_once(|head, mut tcp| async move {
+    let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(head, "POST /path HTTP/1.1\r\ncontent-length: 4\r\n\r\n");
 
         let mut buf = [0, 0, 0, 0];
@@ -44,7 +44,7 @@ async fn post_body() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(tcp)
+        Ok((tcp, false))
     })
     .await?;
 
@@ -53,7 +53,7 @@ async fn post_body() -> Result<(), Error> {
         .body("data")
         .unwrap();
 
-    let (parts, _) = common::run(conn, req).await?;
+    let (parts, _) = common::run(conn.connect().await?, req).await?;
 
     assert_eq!(parts.status, 200);
 
@@ -62,17 +62,17 @@ async fn post_body() -> Result<(), Error> {
 
 #[async_std::test]
 async fn post_body_no_len() -> Result<(), Error> {
-    let conn = common::serve_once(|head, tcp| async move {
+    let conn = common::serve(|head, tcp, _| async move {
         assert_eq!(head, "PUT /path HTTP/1.1\r\n\r\n");
 
-        Ok(tcp)
+        Ok((tcp, false))
     })
     .await?;
 
     // no declared length and yet sending a body, it's an error
     let req = http::Request::put("/path").body("data").unwrap();
 
-    let ret = common::run(conn, req).await;
+    let ret = common::run(conn.connect().await?, req).await;
 
     assert!(ret.is_err());
 
@@ -85,7 +85,7 @@ async fn post_body_no_len() -> Result<(), Error> {
 
 #[async_std::test]
 async fn post_big_body_clen() -> Result<(), Error> {
-    let conn = common::serve_once(|head, mut tcp| async move {
+    let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(
             head,
             "POST /path HTTP/1.1\r\ncontent-length: 10485760\r\n\r\n"
@@ -105,7 +105,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(tcp)
+        Ok((tcp, false))
     })
     .await?;
 
@@ -117,7 +117,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
         .body(big)
         .unwrap();
 
-    let (parts, _) = common::run(conn, req).await?;
+    let (parts, _) = common::run(conn.connect().await?, req).await?;
 
     assert_eq!(parts.status, 200);
 
@@ -126,7 +126,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
 
 #[async_std::test]
 async fn post_big_body_chunked() -> Result<(), Error> {
-    let conn = common::serve_once(|head, mut tcp| async move {
+    let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(
             head,
             "POST /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"
@@ -148,7 +148,7 @@ async fn post_big_body_chunked() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(tcp)
+        Ok((tcp, false))
     })
     .await?;
 
@@ -160,7 +160,7 @@ async fn post_big_body_chunked() -> Result<(), Error> {
         .body(big)
         .unwrap();
 
-    let (parts, _) = common::run(conn, req).await?;
+    let (parts, _) = common::run(conn.connect().await?, req).await?;
 
     assert_eq!(parts.status, 200);
 

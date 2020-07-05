@@ -418,7 +418,7 @@ where
                     // we have a response for sure.
                     b.done_response = true;
 
-                    let limit = LimitRead::from_headers(res.headers());
+                    let limit = LimitRead::from_headers(res.headers(), res.version(), true);
 
                     // https://tools.ietf.org/html/rfc7230#page-31
                     // Any response to a HEAD request and any response with a 1xx
@@ -536,6 +536,7 @@ where
                 // read self.io through the limiter to stop reading when we are
                 // in place for the next request.
                 let amount = ready!(r.limit.poll_read(cx, &mut self.io, &mut r.recv_buf))?;
+                trace!("Response body read: {}", amount);
 
                 if amount > 0 {
                     // scale down buffer to read amount and loop to send off.
@@ -549,20 +550,28 @@ where
                         // received, the recipient MUST consider the message to be
                         // incomplete and close the connection.
                         //
-                        //
                         // https://tools.ietf.org/html/rfc7230#page-33
                         // A client that receives an incomplete response message, which can
                         // occur when a connection is closed prematurely or when decoding a
                         // supposedly chunked transfer coding fails, MUST record the message as
                         // incomplete.
+                        trace!("Close because read body is not complete");
                         const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
                         return Err(io::Error::new(EOF, "Partial body")).into();
                     }
 
-                    // no more response body. ready to handle next request.
-                    // NB. This drops the r.tx_body which means the RecvStream will
-                    // read a 0 amount on next try.
-                    self.state = State::Waiting;
+                    if r.limit.is_reusable() {
+                        // No more response body. ready to handle next request.
+                        // NB. This drops the r.tx_body which means the RecvStream will
+                        // read a 0 amount on next try.
+                        trace!("Reuse connection");
+                        self.state = State::Waiting;
+                    } else {
+                        // This connection can not be reused, could for instance be http/1.0
+                        // without connection: keep-alive.
+                        trace!("Connection is not reusable");
+                        return Ok(false).into();
+                    }
                 }
             }
         }

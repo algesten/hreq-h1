@@ -228,7 +228,7 @@ impl Codec {
                 self.request_buf.resize(0, 0);
 
                 // Limiter to read the correct body amount from the socket.
-                let limit = LimitRead::from_headers(req.headers());
+                let limit = LimitRead::from_headers(req.headers(), req.version(), false);
 
                 // bound channel to get backpressure
                 let (tx_body, rx_body) = mpsc::channel(2);

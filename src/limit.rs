@@ -9,12 +9,19 @@ use std::str::FromStr;
 use std::task::{Context, Poll};
 
 /// Limit reading data given configuration from request headers.
-pub(crate) enum LimitRead {
+pub struct LimitRead {
+    limiter: ReadLimiter,
+    allow_reuse: bool,
+}
+
+enum ReadLimiter {
     /// Read from a chunked decoder. The decoder will know when there is no more
     /// data to be read.
     ChunkedDecoder(ChunkedDecoder),
     /// Body data is limited by a `content-length` header.
-    ContenLength(ContentLengthRead),
+    ContentLength(ContentLengthRead),
+    /// Read until the connection closes (HTTP/1.0).
+    ReadToEnd(ReadToEnd),
     /// No expected body.
     NoBody,
 }
@@ -25,33 +32,80 @@ impl LimitRead {
     /// 1. If header `transfer-encoding: chunked` use chunked decoder regardless of other headers.
     /// 2. If header `content-length: <number>` use a reader limited by length
     /// 3. Otherwise consider there being no body.
-    pub fn from_headers(headers: &http::HeaderMap<http::HeaderValue>) -> Self {
+    pub fn from_headers(
+        headers: &http::HeaderMap<http::HeaderValue>,
+        version: http::Version,
+        is_server_response: bool,
+    ) -> Self {
+        // NB: We're not enforcing 1.0 compliance. it's possible to mix
+        // transfer-encoding: chunked with HTTP/1.0, which should
+        // not be a possible combo.
+
         // https://tools.ietf.org/html/rfc7230#page-31
         // If a message is received with both a Transfer-Encoding and a
         // Content-Length header field, the Transfer-Encoding overrides the
         // Content-Length.
-        if is_chunked(headers) {
-            LimitRead::ChunkedDecoder(ChunkedDecoder::new())
+
+        let limiter = if is_chunked(headers) {
+            ReadLimiter::ChunkedDecoder(ChunkedDecoder::new())
         } else if let Some(size) = get_as::<u64>(headers, "content-length") {
-            LimitRead::ContenLength(ContentLengthRead::new(size))
+            ReadLimiter::ContentLength(ContentLengthRead::new(size))
         } else {
-            LimitRead::NoBody
+            if version == http::Version::HTTP_10 && is_server_response {
+                // https://tools.ietf.org/html/rfc1945#section-7.2.2
+                // When an Entity-Body is included with a message, the length of that
+                // body may be determined in one of two ways. If a Content-Length header
+                // field is present, its value in bytes represents the length of the
+                // Entity-Body. Otherwise, the body length is determined by the closing
+                // of the connection by the server.
+
+                // Closing the connection cannot be used to indicate the end of a
+                // request body, since it leaves no possibility for the server to send
+                // back a response.
+                ReadLimiter::ReadToEnd(ReadToEnd::new())
+            } else {
+                // no content-length, and no chunked, for 1.1 we don't expect a body.
+                ReadLimiter::NoBody
+            }
+        };
+
+        let allow_reuse = if version == http::Version::HTTP_11 {
+            is_keep_alive(headers, true)
+        } else {
+            is_keep_alive(headers, false)
+        };
+
+        LimitRead {
+            limiter,
+            allow_reuse,
         }
     }
 
     pub fn is_no_body(&self) -> bool {
-        if let LimitRead::NoBody = self {
+        if let ReadLimiter::NoBody = &self.limiter {
             return true;
         }
         false
     }
 
     pub fn is_complete(&self) -> bool {
-        match self {
-            LimitRead::ChunkedDecoder(v) => v.is_end(),
-            LimitRead::ContenLength(v) => v.is_end(),
-            LimitRead::NoBody => true,
+        match &self.limiter {
+            ReadLimiter::ChunkedDecoder(v) => v.is_end(),
+            ReadLimiter::ContentLength(v) => v.is_end(),
+            ReadLimiter::ReadToEnd(v) => v.is_end(),
+            ReadLimiter::NoBody => true,
         }
+    }
+
+    pub fn is_reusable(&self) -> bool {
+        self.allow_reuse && self.is_complete() && !self.is_read_to_end()
+    }
+
+    fn is_read_to_end(&self) -> bool {
+        if let ReadLimiter::ReadToEnd(_) = self.limiter {
+            return true;
+        }
+        false
     }
 
     /// Try read some data.
@@ -61,10 +115,11 @@ impl LimitRead {
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        match self {
-            LimitRead::ChunkedDecoder(v) => v.poll_read(cx, recv, buf),
-            LimitRead::ContenLength(v) => v.poll_read(cx, recv, buf),
-            LimitRead::NoBody => Ok(0).into(),
+        match &mut self.limiter {
+            ReadLimiter::ChunkedDecoder(v) => v.poll_read(cx, recv, buf),
+            ReadLimiter::ContentLength(v) => v.poll_read(cx, recv, buf),
+            ReadLimiter::ReadToEnd(v) => v.poll_read(cx, recv, buf),
+            ReadLimiter::NoBody => Ok(0).into(),
         }
     }
 }
@@ -114,6 +169,37 @@ impl ContentLengthRead {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg)).into();
         }
         self.total += amount as u64;
+
+        Ok(amount).into()
+    }
+}
+
+struct ReadToEnd {
+    reached_end: bool,
+}
+
+impl ReadToEnd {
+    fn new() -> Self {
+        ReadToEnd { reached_end: false }
+    }
+
+    fn is_end(&self) -> bool {
+        self.reached_end
+    }
+
+    fn poll_read<R: AsyncRead + Unpin>(
+        &mut self,
+        cx: &mut Context,
+        recv: &mut R,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        assert!(!buf.is_empty(), "poll_read with len 0 buf");
+
+        let amount = ready!(Pin::new(&mut *recv).poll_read(cx, buf))?;
+
+        if amount == 0 {
+            self.reached_end = true;
+        }
 
         Ok(amount).into()
     }
@@ -220,10 +306,11 @@ impl ContentLengthWrite {
 
 impl fmt::Debug for LimitRead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LimitRead::ChunkedDecoder(_) => write!(f, "ChunkedDecoder")?,
-            LimitRead::ContenLength(l) => write!(f, "ContenLength({})", l.limit)?,
-            LimitRead::NoBody => write!(f, "NoBody")?,
+        match &self.limiter {
+            ReadLimiter::ChunkedDecoder(_) => write!(f, "ChunkedDecoder")?,
+            ReadLimiter::ContentLength(l) => write!(f, "ContenLength({})", l.limit)?,
+            ReadLimiter::ReadToEnd(_) => write!(f, "ReadToEnd")?,
+            ReadLimiter::NoBody => write!(f, "NoBody")?,
         }
         Ok(())
     }
@@ -246,6 +333,22 @@ fn is_chunked(headers: &http::HeaderMap<http::HeaderValue>) -> bool {
         .and_then(|h| h.to_str().ok())
         .map(|h| h.contains("chunked"))
         .unwrap_or(false)
+}
+
+fn is_keep_alive(headers: &http::HeaderMap<http::HeaderValue>, default: bool) -> bool {
+    headers
+        .get("connection")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            if h == "keep-alive" {
+                Some(true)
+            } else if h == "close" {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 fn get_str<'a>(headers: &'a http::HeaderMap, key: &str) -> Option<&'a str> {
