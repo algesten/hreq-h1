@@ -21,6 +21,9 @@ use std::task::{Context, Poll};
 /// Size of buffer reading request body into.
 const READ_BUF_INIT_SIZE: usize = 16_384;
 
+/// Buffer size when writing a request.
+const MAX_RESPONSE_SIZE: usize = 8192;
+
 /// "handshake" to create a connection.
 ///
 /// This call is a bit odd, but it's to mirror the h2 crate.
@@ -208,6 +211,8 @@ impl Codec {
         cx: &mut Context<'_>,
         inner: Arc<Mutex<Codec>>,
     ) -> Poll<Result<DriveResult, io::Error>> {
+        trace!("drive_state: {:?}", self.state);
+
         match &mut self.state {
             State::Waiting => {
                 ready!(poll_for_crlfcrlf(cx, &mut self.request_buf, &mut self.io))?;
@@ -338,9 +343,13 @@ impl Codec {
                     // invariant: there should be nothing to send now.
                     assert!(self.to_write.is_empty());
 
+                    self.to_write.resize(MAX_RESPONSE_SIZE, 0);
+
                     // invariant: we should be able to write _any_ response.
                     let amount =
                         write_http1x_res(&res, &mut self.to_write).expect("Write http::Response");
+
+                    self.to_write.resize(amount, 0);
 
                     // invariant: amount must match written buffer length
                     assert_eq!(self.to_write.len(), amount);
@@ -491,5 +500,21 @@ where
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.0).poll_close(cx)
+    }
+}
+
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Waiting => write!(f, "Waiting")?,
+            State::RecvReq => write!(f, "RecvReq")?,
+            State::SendRes(b) => write!(
+                f,
+                "RecvRes done_req_body: {}, done_response: {}",
+                b.done_req_body, b.done_response
+            )?,
+            State::SendBody(_) => write!(f, "SendBody")?,
+        }
+        Ok(())
     }
 }

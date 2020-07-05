@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 
 /// Size of buffer reading response body into.
 const READ_BUF_INIT_SIZE: usize = 16_384;
+
 /// Buffer size when writing a request.
 const MAX_REQUEST_SIZE: usize = 8192;
 

@@ -55,7 +55,7 @@ where
     Ok(Connector(addr))
 }
 
-pub struct Connector(String);
+pub struct Connector(pub String);
 
 impl Connector {
     pub async fn connect(&self) -> Result<TcpStream, Error> {
