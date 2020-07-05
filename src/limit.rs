@@ -99,12 +99,17 @@ impl ContentLengthRead {
         let amount = ready!(Pin::new(&mut *recv).poll_read(cx, &mut buf[0..max]))?;
 
         if left > 0 && amount == 0 {
-            // https://tools.ietf.org/html/rfc7230#page-33
-            // A client that receives an incomplete response message, which can
-            // occur when a connection is closed prematurely or when decoding a
-            // supposedly chunked transfer coding fails, MUST record the message as
-            // incomplete.
-            let msg = format!("Partial body {}/{}", self.total, self.limit);
+            // https://tools.ietf.org/html/rfc7230#page-32
+            // If a valid Content-Length header field is present without
+            // Transfer-Encoding, its decimal value defines the expected message
+            // body length in octets.  If the sender closes the connection or
+            // the recipient times out before the indicated number of octets are
+            // received, the recipient MUST consider the message to be
+            // incomplete and close the connection.
+            let msg = format!(
+                "Partial body received {} bytes and expected {}",
+                self.total, self.limit
+            );
             trace!("{}", msg);
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg)).into();
         }

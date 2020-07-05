@@ -6,6 +6,7 @@ use crate::{AsyncRead, AsyncWrite};
 use crate::{RecvStream, SendStream};
 use futures_channel::{mpsc, oneshot};
 use futures_util::ready;
+use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use std::fmt;
 use std::future::Future;
@@ -71,6 +72,10 @@ impl SendRequest {
         req: http::Request<()>,
         end: bool,
     ) -> Result<(ResponseFuture, SendStream), Error> {
+        if req.method() == http::Method::CONNECT {
+            return Err(Error::User("hreq-h1 does not support CONNECT".into()));
+        }
+
         // Channel to send response back.
         let (res_tx, res_rx) = oneshot::channel();
 
@@ -226,6 +231,7 @@ struct BodyReceiver {
     handle: Handle,
     limit: LimitRead,
     tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
+    tx_body_needs_flush: bool,
     recv_buf: Vec<u8>,
 }
 
@@ -414,11 +420,26 @@ where
 
                     let limit = LimitRead::from_headers(res.headers());
 
+                    // https://tools.ietf.org/html/rfc7230#page-31
+                    // Any response to a HEAD request and any response with a 1xx
+                    // (Informational), 204 (No Content), or 304 (Not Modified) status
+                    // code is always terminated by the first empty line after the
+                    // header fields, regardless of the header fields present in the
+                    // message, and thus cannot contain a message body.
+                    let status = res.status();
+                    let is_no_body = limit.is_no_body()
+                        || b.handle.req.method() == http::Method::HEAD
+                        || status.is_informational()
+                        || status == http::StatusCode::NO_CONTENT
+                        || status == http::StatusCode::NOT_MODIFIED;
+
+                    // TODO: handle CONNECT with a special state where connection becomes a tunnel
+
                     // bounded to have backpressure if client is reading slowly.
                     let (tx_body, rx_body) = mpsc::channel(2);
 
                     // holder indicates whether we expect a body.
-                    b.holder = if limit.is_no_body() {
+                    b.holder = if is_no_body {
                         None
                     } else {
                         Some((tx_body, limit))
@@ -456,6 +477,7 @@ where
                         self.state = State::RecvBody(BodyReceiver {
                             handle,
                             tx_body,
+                            tx_body_needs_flush: false,
                             limit,
                             recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
                         });
@@ -475,6 +497,14 @@ where
             }
 
             State::RecvBody(r) => {
+                // if the tx_body needs flushing, deal with that first
+                if r.tx_body_needs_flush {
+                    // if the flushing fails, the receiver is gone, that's ok.
+                    ready!(Pin::new(&mut r.tx_body).poll_flush(cx)).ok();
+
+                    r.tx_body_needs_flush = false;
+                }
+
                 if !r.recv_buf.is_empty() {
                     // we got a chunk read to send off to the RecvStream
                     if let Err(_) = ready!(r.tx_body.poll_ready(cx)) {
@@ -489,6 +519,12 @@ where
                     // Since we poll_ready above, the error here is that the receiver is gone,
                     // which isn't a problem.
                     r.tx_body.start_send(Ok(chunk)).ok();
+
+                    // As per the Sink contract, flush after start_send()
+                    r.tx_body_needs_flush = true;
+
+                    // loop
+                    return Ok(true).into();
                 }
 
                 // invariant: if we're here, the recv_buffer must be empty.
@@ -507,7 +543,20 @@ where
                 } else {
                     // ensure the limiter was complete, or drop the connection.
                     if !r.limit.is_complete() {
-                        return Err(io::Error::new(io::ErrorKind::Other, "Partial body")).into();
+                        // https://tools.ietf.org/html/rfc7230#page-32
+                        // If the sender closes the connection or
+                        // the recipient times out before the indicated number of octets are
+                        // received, the recipient MUST consider the message to be
+                        // incomplete and close the connection.
+                        //
+                        //
+                        // https://tools.ietf.org/html/rfc7230#page-33
+                        // A client that receives an incomplete response message, which can
+                        // occur when a connection is closed prematurely or when decoding a
+                        // supposedly chunked transfer coding fails, MUST record the message as
+                        // incomplete.
+                        const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
+                        return Err(io::Error::new(EOF, "Partial body")).into();
                     }
 
                     // no more response body. ready to handle next request.

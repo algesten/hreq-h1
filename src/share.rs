@@ -6,6 +6,7 @@ use crate::Error;
 use futures_channel::mpsc;
 use futures_util::future::poll_fn;
 use futures_util::ready;
+use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use std::fmt;
 use std::io;
@@ -44,7 +45,7 @@ impl SendStream {
     }
 
     /// Poll for whether this connection is ready to send more data without blocking.
-    pub fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         // must drive the connection if server.
@@ -70,7 +71,7 @@ impl SendStream {
     ///
     /// `end` controls whether this is the last body chunk to send. It's an error
     /// to send more data after `end` is `true`.
-    pub fn poll_send_data(
+    fn poll_send_data(
         self: Pin<&mut Self>,
         cx: &mut Context,
         data: &[u8],
@@ -102,8 +103,20 @@ impl SendStream {
         Ok(()).into()
     }
 
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let this = self.get_mut();
+
+        ready!(Pin::new(&mut this.tx_body)
+            .poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e)))?;
+
+        Ok(()).into()
+    }
+
     pub async fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
-        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await?;
+        Ok(())
     }
 }
 

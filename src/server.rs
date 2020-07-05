@@ -7,6 +7,7 @@ use crate::{AsyncRead, AsyncWrite};
 use futures_channel::{mpsc, oneshot};
 use futures_util::future::poll_fn;
 use futures_util::ready;
+use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 use std::fmt;
 use std::future::Future;
@@ -114,6 +115,7 @@ enum State {
 struct Bidirect {
     limit: LimitRead,
     tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
+    tx_body_needs_flush: bool,
     rx_res: oneshot::Receiver<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,
     done_req_body: bool,
     done_response: bool,
@@ -250,6 +252,7 @@ impl Codec {
                 self.state = State::SendRes(Bidirect {
                     limit,
                     tx_body,
+                    tx_body_needs_flush: false,
                     rx_res,
                     done_req_body,
                     done_response: false,
@@ -262,6 +265,14 @@ impl Codec {
             }
 
             State::SendRes(h) => {
+                // if the tx_body needs flushing, deal with that first
+                if h.tx_body_needs_flush {
+                    // The RecvStream might be dropped, that's ok.
+                    ready!(Pin::new(&mut h.tx_body).poll_flush(cx)).ok();
+
+                    h.tx_body_needs_flush = false;
+                }
+
                 let mut req_body_pending = false;
 
                 if !h.done_req_body {
@@ -277,6 +288,9 @@ impl Codec {
 
                         // The RecvStream might be dropped, that's ok.
                         h.tx_body.start_send(Ok(chunk)).ok();
+
+                        // As per Sink contract, fush after send.
+                        h.tx_body_needs_flush = true;
                     }
 
                     // invariant: there should be nothing in the buffer now.

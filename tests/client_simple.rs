@@ -4,7 +4,7 @@ use hreq_h1::Error;
 mod common;
 use common::HeaderMapExt;
 
-#[tokio::test]
+#[async_std::test]
 async fn request_200_ok() -> Result<(), Error> {
     let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(head, "GET /path HTTP/1.1\r\naccept: */*\r\n\r\n");
@@ -12,7 +12,7 @@ async fn request_200_ok() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
         tcp.write_all(res).await.unwrap();
 
-        Ok(())
+        Ok(tcp)
     })
     .await?;
 
@@ -31,7 +31,7 @@ async fn request_200_ok() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn post_body() -> Result<(), Error> {
     let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(head, "POST /path HTTP/1.1\r\ncontent-length: 4\r\n\r\n");
@@ -44,7 +44,7 @@ async fn post_body() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(())
+        Ok(tcp)
     })
     .await?;
 
@@ -60,12 +60,12 @@ async fn post_body() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn post_body_no_len() -> Result<(), Error> {
-    let conn = common::serve_once(|head, _| async move {
-        assert_eq!(head, "");
+    let conn = common::serve_once(|head, tcp| async move {
+        assert_eq!(head, "PUT /path HTTP/1.1\r\n\r\n");
 
-        Ok(())
+        Ok(tcp)
     })
     .await?;
 
@@ -83,7 +83,7 @@ async fn post_body_no_len() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn post_big_body_clen() -> Result<(), Error> {
     let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(
@@ -105,7 +105,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(())
+        Ok(tcp)
     })
     .await?;
 
@@ -124,7 +124,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn post_big_body_chunked() -> Result<(), Error> {
     let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(
@@ -148,7 +148,7 @@ async fn post_big_body_chunked() -> Result<(), Error> {
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
         tcp.write_all(res).await.unwrap();
 
-        Ok(())
+        Ok(tcp)
     })
     .await?;
 
