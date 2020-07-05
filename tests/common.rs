@@ -1,5 +1,5 @@
 use async_std::net::{TcpListener, TcpStream};
-use futures_io::{AsyncRead, AsyncWrite};
+use futures_io::AsyncRead;
 use futures_util::future::poll_fn;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use hreq_h1::Error;
@@ -8,7 +8,7 @@ use std::io;
 use std::str::FromStr;
 use std::sync::Once;
 
-pub async fn serve_once<F, R>(f: F) -> Result<impl Stream, io::Error>
+pub async fn serve_once<F, R>(f: F) -> Result<TcpStream, io::Error>
 where
     F: Send + 'static,
     F: FnOnce(String, TcpStream) -> R,
@@ -41,10 +41,10 @@ where
 }
 
 pub async fn run<B: AsRef<[u8]>>(
-    stream: impl Stream,
+    tcp: TcpStream,
     req: http::Request<B>,
 ) -> Result<(http::response::Parts, Vec<u8>), Error> {
-    let (mut send, conn) = hreq_h1::client::handshake(stream);
+    let (mut send, conn) = hreq_h1::client::handshake(tcp);
 
     async_std::task::spawn(async move {
         if let Err(_e) = conn.await {
@@ -83,10 +83,6 @@ pub async fn run<B: AsRef<[u8]>>(
 
     Ok((parts, v))
 }
-
-pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-
-impl Stream for TcpStream {}
 
 pub async fn read_header<S: AsyncRead + Unpin>(io: &mut S) -> Result<String, Error> {
     let mut buf = vec![];
