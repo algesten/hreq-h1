@@ -5,9 +5,11 @@ extern crate log;
 
 mod chunked;
 mod error;
-mod http11;
 mod limit;
 mod share;
+
+#[doc(hidden)]
+pub mod http11;
 
 pub(crate) use futures_io::{AsyncRead, AsyncWrite};
 

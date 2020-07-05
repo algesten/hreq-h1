@@ -11,3 +11,8 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 http = "0.2"
 httparse = "1"
 log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.7"
+pretty_env_logger = "0.4"
+tokio = { version = "0.2", default-featulres = false, features = ["rt-threaded", "net", "tcp", "time", "fs", "macros"] }

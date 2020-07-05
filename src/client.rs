@@ -16,6 +16,8 @@ use std::task::{Context, Poll};
 
 /// Size of buffer reading response body into.
 const READ_BUF_INIT_SIZE: usize = 16_384;
+/// Buffer size when writing a request.
+const MAX_REQUEST_SIZE: usize = 8192;
 
 /// Creates a new HTTP/1 client backed by some async `io` connection.
 ///
@@ -233,7 +235,7 @@ where
         Codec {
             io,
             req_rx,
-            to_write: vec![],
+            to_write: Vec::with_capacity(MAX_REQUEST_SIZE),
             state: State::Waiting,
         }
     }
@@ -331,9 +333,13 @@ where
                 // invariant: should be no bytes waiting to be written at this point.
                 assert!(self.to_write.is_empty());
 
-                if let Err(e) = write_http11_req(&h.req, &mut self.to_write) {
-                    return Err(e).into();
-                }
+                // prep size.
+                self.to_write.resize(MAX_REQUEST_SIZE, 0);
+
+                let amount = write_http11_req(&h.req, &mut self.to_write)?;
+
+                // scale down
+                self.to_write.resize(amount, 0);
 
                 // if we don't expect a request body, we mark the next state as being
                 // done for send body already.

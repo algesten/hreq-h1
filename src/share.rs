@@ -1,6 +1,7 @@
 use crate::limit::LimitWrite;
 use crate::server::Codec;
 use crate::server::ServerDrive;
+use crate::AsyncRead;
 use crate::Error;
 use futures_channel::mpsc;
 use futures_util::future::poll_fn;
@@ -119,6 +120,7 @@ pub struct RecvStream {
     // used in RecvStream originating in server to drive the connection
     // from the RecvStream polling itelf.
     server_inner: Option<Arc<Mutex<Codec>>>,
+    ended: bool,
 }
 
 impl RecvStream {
@@ -131,11 +133,12 @@ impl RecvStream {
             ready: None,
             index: 0,
             server_inner,
+            ended: false,
         }
     }
 
-    /// Read some body data in an async way.
-    pub fn poll_read(
+    /// Poll for some body data.
+    pub fn poll_body_data(
         self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
@@ -171,6 +174,7 @@ impl RecvStream {
             match ready!(Pin::new(&mut this.rx_body).poll_next(cx)) {
                 None => {
                     // Channel is closed which indicates end of body.
+                    this.ended = true;
                     return Ok(0).into();
                 }
                 Some(v) => {
@@ -189,7 +193,17 @@ impl RecvStream {
     }
 
     pub fn is_end(&self) -> bool {
-        todo!()
+        self.ended
+    }
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_body_data(cx, buf)
     }
 }
 

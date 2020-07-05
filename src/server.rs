@@ -25,7 +25,7 @@ const READ_BUF_INIT_SIZE: usize = 16_384;
 /// This call is a bit odd, but it's to mirror the h2 crate.
 pub fn handshake<S>(io: S) -> Connection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     Connection(Arc::new(Mutex::new(Codec::new(io))), PhantomData)
 }
@@ -136,7 +136,7 @@ enum DriveResult {
 }
 
 impl Codec {
-    fn new<S: AsyncRead + AsyncWrite + Unpin + 'static>(io: S) -> Self {
+    fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: S) -> Self {
         Codec {
             io: Box::new(IoAdapt(io)),
             state: State::Waiting,
@@ -437,11 +437,11 @@ impl fmt::Debug for SendResponse {
 
 // ***************** Boiler plate to hide IO behind a Box<dyn trait> ***************
 
-trait Io: AsyncRead + AsyncWrite + Unpin + 'static {}
+trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 struct IoAdapt<S>(S);
 
-impl<S> Io for IoAdapt<S> where S: AsyncRead + AsyncWrite + Unpin + 'static {}
+impl<S> Io for IoAdapt<S> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 impl<S> AsyncRead for IoAdapt<S>
 where
