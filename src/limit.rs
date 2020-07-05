@@ -5,6 +5,7 @@ use futures_util::ready;
 use std::fmt;
 use std::io;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::task::{Context, Poll};
 
 /// Limit reading data given configuration from request headers.
@@ -25,16 +26,13 @@ impl LimitRead {
     /// 2. If header `content-length: <number>` use a reader limited by length
     /// 3. Otherwise consider there being no body.
     pub fn from_headers(headers: &http::HeaderMap<http::HeaderValue>) -> Self {
-        let transfer_enc_chunk = headers
-            .get("transfer-encoding")
-            .map(|h| h == "chunked")
-            .unwrap_or(false);
-
-        let content_length = get_as::<u64>(headers, "content-length");
-
-        if transfer_enc_chunk {
+        // https://tools.ietf.org/html/rfc7230#page-31
+        // If a message is received with both a Transfer-Encoding and a
+        // Content-Length header field, the Transfer-Encoding overrides the
+        // Content-Length.
+        if is_chunked(headers) {
             LimitRead::ChunkedDecoder(ChunkedDecoder::new())
-        } else if let Some(size) = content_length {
+        } else if let Some(size) = get_as::<u64>(headers, "content-length") {
             LimitRead::ContenLength(ContentLengthRead::new(size))
         } else {
             LimitRead::NoBody
@@ -46,6 +44,14 @@ impl LimitRead {
             return true;
         }
         false
+    }
+
+    pub fn is_complete(&self) -> bool {
+        match self {
+            LimitRead::ChunkedDecoder(v) => v.is_end(),
+            LimitRead::ContenLength(v) => v.is_end(),
+            LimitRead::NoBody => true,
+        }
     }
 
     /// Try read some data.
@@ -68,41 +74,39 @@ impl LimitRead {
 pub struct ContentLengthRead {
     limit: u64,
     total: u64,
-    reached_end: bool,
 }
 
 impl ContentLengthRead {
     fn new(limit: u64) -> Self {
-        ContentLengthRead {
-            limit,
-            total: 0,
-            reached_end: false,
-        }
+        ContentLengthRead { limit, total: 0 }
     }
+
+    fn is_end(&self) -> bool {
+        self.total == self.limit
+    }
+
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let left = (self.limit - self.total).min(usize::max_value() as u64) as usize;
+        assert!(!buf.is_empty(), "poll_read with len 0 buf");
 
-        if left == 0 {
-            // we need to put the underlying connection in the right
-            // state to receive another request.
-            if !self.reached_end {
-                let mut end = [];
-                ready!(Pin::new(&mut *recv).poll_read(cx, &mut end[..]))?;
-                self.reached_end = true;
-            }
-            return Ok(0).into();
-        }
+        let left = (self.limit - self.total).min(usize::max_value() as u64) as usize;
 
         let max = buf.len().min(left);
         let amount = ready!(Pin::new(&mut *recv).poll_read(cx, &mut buf[0..max]))?;
 
-        if amount == 0 {
-            self.reached_end = true;
+        if left > 0 && amount == 0 {
+            // https://tools.ietf.org/html/rfc7230#page-33
+            // A client that receives an incomplete response message, which can
+            // occur when a connection is closed prematurely or when decoding a
+            // supposedly chunked transfer coding fails, MUST record the message as
+            // incomplete.
+            let msg = format!("Partial body {}/{}", self.total, self.limit);
+            trace!("{}", msg);
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg)).into();
         }
         self.total += amount as u64;
 
@@ -131,25 +135,15 @@ impl LimitWrite {
     ///
     /// 1. If header `transfer-encoding: chunked` use chunked encoder regardless of other headers.
     /// 2. If header `content-length: <number>` use a reader limited by length
-    /// 3. Otherwise use chunked (will do nothing unless written to).
+    /// 3. Otherwise expect no body.
     pub fn from_headers(headers: &http::HeaderMap<http::HeaderValue>) -> Self {
-        let transfer_enc_chunk = headers
-            .get("transfer-encoding")
-            .map(|h| h == "chunked")
-            .unwrap_or(false);
-
-        let content_length = get_as::<u64>(headers, "content-length");
-
-        // also use chunked when we don't know.
-        let use_chunked = transfer_enc_chunk || content_length.is_none();
-
-        if use_chunked {
-            if content_length.is_some() {
-                // this is technically an error
-                warn!("Ignoring content-length in favor of transfer-encoding: chunked");
-            }
+        // https://tools.ietf.org/html/rfc7230#page-31
+        // If a message is received with both a Transfer-Encoding and a
+        // Content-Length header field, the Transfer-Encoding overrides the
+        // Content-Length.
+        if is_chunked(headers) {
             LimitWrite::ChunkedEncoder
-        } else if let Some(limit) = content_length {
+        } else if let Some(limit) = get_as::<u64>(headers, "content-length") {
             LimitWrite::ContentLength(ContentLengthWrite::new(limit))
         } else {
             LimitWrite::NoBody
@@ -241,7 +235,13 @@ impl fmt::Debug for LimitWrite {
     }
 }
 
-use std::str::FromStr;
+fn is_chunked(headers: &http::HeaderMap<http::HeaderValue>) -> bool {
+    headers
+        .get("transfer-encoding")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.contains("chunked"))
+        .unwrap_or(false)
+}
 
 fn get_str<'a>(headers: &'a http::HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key).and_then(|v| v.to_str().ok())

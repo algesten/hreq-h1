@@ -32,6 +32,10 @@ impl ChunkedDecoder {
         }
     }
 
+    pub fn is_end(&self) -> bool {
+        self.state == DecoderState::End
+    }
+
     pub fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,

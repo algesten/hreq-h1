@@ -434,6 +434,12 @@ where
                 // only proceed out of this state if we have both finished sending a request
                 // body and received a response header.
                 if b.done_req_body && b.done_response {
+                    // TODO: We could validate we actually sent as much body data that was
+                    // declared by a content-length header and/or that we sent the chunked
+                    // indication for complete. The spec doesn't mention this case specifically,
+                    // but it's clearly in "the spirit" to not send half messages.
+                    // https://tools.ietf.org/html/rfc7230#page-33
+
                     if let Some((tx_body, limit)) = b.holder.take() {
                         // expect a response body.
                         let handle = self.state.take_handle();
@@ -490,6 +496,11 @@ where
                     // scale down buffer to read amount and loop to send off.
                     r.recv_buf.resize(amount, 0);
                 } else {
+                    // ensure the limiter was complete, or drop the connection.
+                    if !r.limit.is_complete() {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Partial body")).into();
+                    }
+
                     // no more response body. ready to handle next request.
                     // NB. This drops the r.tx_body which means the RecvStream will
                     // read a 0 amount on next try.
