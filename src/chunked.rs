@@ -1,5 +1,6 @@
 use super::AsyncRead;
 use super::Error;
+use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::io;
 use std::io::Write;
@@ -8,7 +9,7 @@ use std::task::{Context, Poll};
 
 /// Decoder to read a `transfer-encoding: chunked` stream.
 #[derive(Debug)]
-pub(crate) struct ChunkedDecoder {
+pub struct ChunkedDecoder {
     amount_left: usize,
     state: DecoderState,
     chunk_size_buf: Vec<u8>,
@@ -34,6 +35,14 @@ impl ChunkedDecoder {
 
     pub fn is_end(&self) -> bool {
         self.state == DecoderState::End
+    }
+
+    pub async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        recv: &mut R,
+        buf: &mut [u8],
+    ) -> io::Result<usize> {
+        Ok(poll_fn(|cx| self.poll_read(cx, recv, buf)).await?)
     }
 
     pub fn poll_read<R: AsyncRead + Unpin>(

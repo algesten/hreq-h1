@@ -152,7 +152,7 @@ impl Codec {
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         loop {
             // try write any bytes ready to be sent.
-            self.try_write(cx)?;
+            while self.try_write(cx)? {}
 
             let ret = ready!(self.drive_state(cx, inner.clone()))?;
             match ret {
@@ -168,9 +168,9 @@ impl Codec {
     }
 
     /// Try write outgoing bytes.
-    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         if self.to_write.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         trace!("try_write left: {}", self.to_write.len());
@@ -182,6 +182,7 @@ impl Codec {
                 // Pending is fine. It means the socket is full upstream, we can still
                 // progress the downstream (i.e. drive_state()).
                 trace!("try_write: Poll::Pending");
+                return Ok(false);
             }
 
             // We managed to write some.
@@ -197,7 +198,7 @@ impl Codec {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn drive_state(

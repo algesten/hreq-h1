@@ -51,8 +51,19 @@ pub async fn run<B: AsRef<[u8]>>(
     let (fut, mut body_send) = send.send_request(req, body.is_empty())?;
 
     if !body.is_empty() {
-        body_send = body_send.ready().await?;
-        body_send.send_data(body, true).await?;
+        // send body in reasonable chunks
+        const MAX: usize = 11_111; // odd number just to force weird offsets
+
+        let mut i = 0;
+
+        while i < body.len() {
+            let max = (body.len() - i).min(MAX);
+            body_send = body_send.ready().await?;
+            body_send.send_data(&body[i..(i + max)], false).await?;
+            i += max;
+        }
+
+        body_send.send_data(&[], true).await?;
     }
 
     let res = fut.await?;

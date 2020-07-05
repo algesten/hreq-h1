@@ -3,13 +3,15 @@
 #[macro_use]
 extern crate log;
 
-mod chunked;
 mod error;
 mod limit;
 mod share;
 
 #[doc(hidden)]
 pub mod http11;
+
+#[doc(hidden)]
+pub mod chunked;
 
 pub(crate) use futures_io::{AsyncRead, AsyncWrite};
 

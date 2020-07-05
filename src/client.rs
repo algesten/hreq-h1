@@ -242,8 +242,8 @@ where
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            // first try to write queued outgoing bytes,
-            self.try_write(cx)?;
+            // first try to write queued outgoing bytes until it is pending or empty,
+            while self.try_write(cx)? {}
 
             // then drive state forward
             match ready!(self.drive_state(cx)) {
@@ -274,9 +274,9 @@ where
     }
 
     /// Try write outgoing bytes.
-    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         if self.to_write.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         trace!("try_write left: {}", self.to_write.len());
@@ -288,6 +288,7 @@ where
                 // Pending is fine. It means the socket is full upstream, we can still
                 // progress the downstream (i.e. drive_state()).
                 trace!("try_write: Poll::Pending");
+                return Ok(false);
             }
 
             // We managed to write some.
@@ -303,7 +304,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn drive_state(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -363,11 +364,14 @@ where
                     // Not done sending a request body. Try get a body chunk to send.
                     match Pin::new(&mut b.handle.rx_body).poll_next(cx) {
                         Poll::Pending => {
+                            trace!("No body chunk to send");
                             // Pending is ok, it means the SendBody has not sent any chunk.
                             req_body_pending = true;
                         }
 
                         Poll::Ready(Some((mut chunk, end))) => {
+                            trace!("Got body chunk len: {}, end: {}", chunk.len(), end);
+
                             // Got a chunk to send
                             if self.to_write.is_empty() {
                                 self.to_write = chunk;
@@ -379,6 +383,9 @@ where
                             if end {
                                 b.done_req_body = true;
                             }
+
+                            // loop to try write body.
+                            return Ok(true).into();
                         }
 
                         Poll::Ready(None) => {
