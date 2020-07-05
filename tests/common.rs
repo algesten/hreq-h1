@@ -1,13 +1,71 @@
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::future::poll_fn;
+use futures_util::AsyncReadExt;
 use hreq_h1::Error;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Once;
 use std::task::{Context, Poll};
+use tokio::net::{TcpListener, TcpStream};
 
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
+
+pub async fn serve_once<F, R>(f: F) -> Result<impl Stream, io::Error>
+where
+    F: Send + 'static,
+    F: FnOnce(FromAdapter<TcpStream>) -> R,
+    R: Future<Output = Result<(), Error>> + Send,
+{
+    let mut l = TcpListener::bind("127.0.0.1:0").await?;
+    let p = l.local_addr()?.port();
+
+    tokio::spawn(async move {
+        let (tcp, _) = l.accept().await.expect("Accept failed");
+        let tcp = from_tokio(tcp);
+        if let Err(e) = f(tcp).await {
+            panic!("run_one failed: {}", e)
+        }
+    });
+
+    let addr = format!("127.0.0.1:{}", p);
+
+    Ok(from_tokio(TcpStream::connect(addr).await?))
+}
+
+pub async fn run<B: AsRef<[u8]>>(
+    stream: impl Stream,
+    req: http::Request<B>,
+) -> Result<(http::response::Parts, Vec<u8>), Error> {
+    let (mut send, conn) = hreq_h1::client::handshake(stream);
+
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+
+    let (parts, body) = req.into_parts();
+    let req = http::Request::from_parts(parts, ());
+    let body: &[u8] = body.as_ref();
+
+    let (fut, mut body_send) = send.send_request(req, body.is_empty())?;
+
+    if !body.is_empty() {
+        body_send = body_send.ready().await?;
+        body_send.send_data(body, true).await?;
+    }
+
+    let res = fut.await?;
+
+    let (parts, mut body) = res.into_parts();
+
+    let mut v = vec![];
+    body.read_to_end(&mut v).await?;
+
+    Ok((parts, v))
+}
+
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 pub async fn read_header<S: AsyncRead + Unpin>(io: &mut S) -> Result<String, Error> {
     let mut buf = vec![];
@@ -72,6 +130,8 @@ where
 pub struct FromAdapter<Z> {
     adapted: Z,
 }
+
+impl<Z> Stream for FromAdapter<Z> where Z: TokioAsyncRead + TokioAsyncWrite + Unpin + Send + 'static {}
 
 impl<Z: TokioAsyncRead + Unpin> AsyncRead for FromAdapter<Z> {
     fn poll_read(
