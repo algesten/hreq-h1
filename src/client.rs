@@ -79,10 +79,12 @@ impl SendRequest {
 
         let limit = LimitWrite::from_headers(req.headers());
 
+        let no_send_body = end || limit.is_no_body();
+
         // The handle for the codec/connection.
         let next = Handle {
             req,
-            no_send_body: end,
+            no_send_body,
             rx_body,
             res_tx: Some(res_tx),
         };
@@ -93,7 +95,7 @@ impl SendRequest {
         }
 
         let fut = ResponseFuture(res_rx);
-        let send = SendStream::new(tx_body, limit, end, None);
+        let send = SendStream::new(tx_body, limit, no_send_body, None);
 
         Ok((fut, send))
     }

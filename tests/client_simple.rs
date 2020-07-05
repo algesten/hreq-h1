@@ -6,10 +6,7 @@ use common::HeaderMapExt;
 
 #[tokio::test]
 async fn request_200_ok() -> Result<(), Error> {
-    common::setup_logger();
-
-    let conn = common::serve_once(|mut tcp| async move {
-        let head = common::read_header(&mut tcp).await.unwrap();
+    let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(head, "GET /path HTTP/1.1\r\naccept: */*\r\n\r\n");
 
         let res = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
@@ -36,10 +33,7 @@ async fn request_200_ok() -> Result<(), Error> {
 
 #[tokio::test]
 async fn post_body() -> Result<(), Error> {
-    common::setup_logger();
-
-    let conn = common::serve_once(|mut tcp| async move {
-        let head = common::read_header(&mut tcp).await.unwrap();
+    let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(head, "POST /path HTTP/1.1\r\ncontent-length: 4\r\n\r\n");
 
         let mut buf = [0, 0, 0, 0];
@@ -67,11 +61,31 @@ async fn post_body() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn post_big_body_clen() -> Result<(), Error> {
-    common::setup_logger();
+async fn post_body_no_len() -> Result<(), Error> {
+    let conn = common::serve_once(|head, _| async move {
+        assert_eq!(head, "");
 
-    let conn = common::serve_once(|mut tcp| async move {
-        let head = common::read_header(&mut tcp).await.unwrap();
+        Ok(())
+    })
+    .await?;
+
+    // no declared length and yet sending a body, it's an error
+    let req = http::Request::put("/path").body("data").unwrap();
+
+    let ret = common::run(conn, req).await;
+
+    assert!(ret.is_err());
+
+    let err = ret.unwrap_err();
+
+    assert_eq!(err.to_string(), "Body data is not expected");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_big_body_clen() -> Result<(), Error> {
+    let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(
             head,
             "POST /path HTTP/1.1\r\ncontent-length: 10485760\r\n\r\n"
@@ -112,10 +126,7 @@ async fn post_big_body_clen() -> Result<(), Error> {
 
 #[tokio::test]
 async fn post_big_body_chunked() -> Result<(), Error> {
-    common::setup_logger();
-
-    let conn = common::serve_once(|mut tcp| async move {
-        let head = common::read_header(&mut tcp).await.unwrap();
+    let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(
             head,
             "POST /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"

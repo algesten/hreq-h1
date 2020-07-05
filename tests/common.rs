@@ -15,16 +15,21 @@ use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 pub async fn serve_once<F, R>(f: F) -> Result<impl Stream, io::Error>
 where
     F: Send + 'static,
-    F: FnOnce(FromAdapter<TcpStream>) -> R,
+    F: FnOnce(String, FromAdapter<TcpStream>) -> R,
     R: Future<Output = Result<(), Error>> + Send,
 {
+    setup_logger();
+
     let mut l = TcpListener::bind("127.0.0.1:0").await?;
     let p = l.local_addr()?.port();
 
     tokio::spawn(async move {
         let (tcp, _) = l.accept().await.expect("Accept failed");
-        let tcp = from_tokio(tcp);
-        if let Err(e) = f(tcp).await {
+        let mut tcp = from_tokio(tcp);
+
+        let head = read_header(&mut tcp).await.unwrap();
+
+        if let Err(e) = f(head, tcp).await {
             panic!("run_one failed: {}", e)
         }
     });
