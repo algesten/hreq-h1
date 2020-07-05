@@ -26,6 +26,27 @@ async fn broken_chunked() -> Result<(), Error> {
 }
 
 #[async_std::test]
+async fn partial_response_header() -> Result<(), Error> {
+    let conn = common::serve_once(|head, mut tcp| async move {
+        assert_eq!(head, "GET /path HTTP/1.1\r\n\r\n");
+
+        let res = b"HTTP/1.1 200 OK\r\nContent-Len";
+        tcp.write_all(res).await.unwrap();
+
+        Ok(tcp)
+    })
+    .await?;
+
+    let req = http::Request::get("/path").body("").unwrap();
+
+    let err = common::run(conn, req).await.expect_err("partial response");
+
+    assert_eq!(err.to_string(), "EOF before complete http11 header");
+
+    Ok(())
+}
+
+#[async_std::test]
 async fn partial_response_clen() -> Result<(), Error> {
     let conn = common::serve_once(|head, mut tcp| async move {
         assert_eq!(head, "GET /path HTTP/1.1\r\n\r\n");
@@ -68,6 +89,25 @@ async fn partial_response_chunked() -> Result<(), Error> {
     let err = common::run(conn, req).await.expect_err("partial response");
 
     assert_eq!(err.to_string(), "Partial body");
+
+    Ok(())
+}
+
+#[async_std::test]
+async fn post_larger_than_clen() -> Result<(), Error> {
+    let conn = common::serve_once(|_, tcp| async move { Ok(tcp) }).await?;
+
+    let req = http::Request::post("/path")
+        .header("content-length", 2)
+        .body("HELLO")
+        .unwrap();
+
+    let err = common::run(conn, req).await.expect_err("partial response");
+
+    assert_eq!(
+        err.to_string(),
+        "Body data longer than content-length header: 5 > 2"
+    );
 
     Ok(())
 }

@@ -209,7 +209,7 @@ impl ContentLengthWrite {
                 "Body data longer than content-length header: {} > {}",
                 self.total, self.limit
             );
-            return Err(Error::Proto(m));
+            return Err(Error::User(m));
         }
         let cur_len = out.len();
         out.resize(cur_len + data.len(), 0);
