@@ -148,6 +148,7 @@ struct Codec<S> {
     io: S,
     req_rx: mpsc::Receiver<Handle>,
     to_write: Vec<u8>,
+    to_write_flush_after: bool,
     state: State,
 }
 
@@ -248,6 +249,7 @@ where
             io,
             req_rx,
             to_write: Vec::with_capacity(MAX_REQUEST_SIZE),
+            to_write_flush_after: false,
             state: State::Waiting,
         }
     }
@@ -255,7 +257,12 @@ where
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             // first try to write queued outgoing bytes until it is pending or empty,
-            while self.try_write(cx)? {}
+            while try_write(
+                cx,
+                &mut self.io,
+                &mut self.to_write,
+                &mut self.to_write_flush_after,
+            )? {}
 
             // then drive state forward
             match ready!(self.drive_state(cx)) {
@@ -283,40 +290,6 @@ where
         }
 
         Ok(()).into()
-    }
-
-    /// Try write outgoing bytes.
-    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        if self.to_write.is_empty() {
-            return Ok(false);
-        }
-
-        trace!("try_write left: {}", self.to_write.len());
-
-        let poll = Pin::new(&mut self.io).poll_write(cx, &self.to_write);
-
-        match poll {
-            Poll::Pending => {
-                // Pending is fine. It means the socket is full upstream, we can still
-                // progress the downstream (i.e. drive_state()).
-                trace!("try_write: Poll::Pending");
-                return Ok(false);
-            }
-
-            // We managed to write some.
-            Poll::Ready(Ok(amount)) => {
-                trace!("try_write did write: {}", amount);
-                // TODO: some more efficient buffer?
-                self.to_write = self.to_write.split_off(amount);
-            }
-
-            Poll::Ready(Err(e)) => {
-                trace!("try_write error: {:?}", e);
-                return Err(e).into();
-            }
-        }
-
-        Ok(true)
     }
 
     fn drive_state(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -353,6 +326,7 @@ where
 
                 // scale down
                 self.to_write.resize(amount, 0);
+                self.to_write_flush_after = true;
 
                 // if we don't expect a request body, we mark the next state as being
                 // done for send body already.
@@ -391,6 +365,7 @@ where
                             } else {
                                 self.to_write.append(&mut chunk);
                             }
+                            self.to_write_flush_after = false;
 
                             // Sender signalled end of stream
                             if end {
@@ -612,4 +587,62 @@ impl fmt::Debug for State {
         }
         Ok(())
     }
+}
+
+pub(crate) fn try_write<S: AsyncWrite + Unpin>(
+    cx: &mut Context<'_>,
+    io: &mut S,
+    to_write: &mut Vec<u8>,
+    to_write_flush_after: &mut bool,
+) -> io::Result<bool> {
+    if to_write.is_empty() {
+        if *to_write_flush_after {
+            trace!("try_write attempt flush");
+
+            match Pin::new(io).poll_flush(cx) {
+                Poll::Pending => {
+                    return Ok(false);
+                }
+                Poll::Ready(Ok(_)) => {
+                    trace!("try_write flushed");
+                    // flush done
+                    *to_write_flush_after = false;
+                }
+                Poll::Ready(Err(e)) => {
+                    trace!("try_write error: {:?}", e);
+                    return Err(e).into();
+                }
+            }
+        }
+
+        return Ok(false);
+    }
+
+    trace!("try_write left: {}", to_write.len());
+
+    let poll = Pin::new(io).poll_write(cx, &to_write);
+
+    match poll {
+        Poll::Pending => {
+            // Pending is fine. It means the socket is full upstream, we can still
+            // progress the downstream (i.e. drive_state()).
+            trace!("try_write: Poll::Pending");
+            return Ok(false);
+        }
+
+        // We managed to write some.
+        Poll::Ready(Ok(amount)) => {
+            trace!("try_write did write: {}", amount);
+            // TODO: some more efficient buffer?
+            let remain = to_write.split_off(amount);
+            mem::replace(to_write, remain);
+        }
+
+        Poll::Ready(Err(e)) => {
+            trace!("try_write error: {:?}", e);
+            return Err(e).into();
+        }
+    }
+
+    Ok(true)
 }

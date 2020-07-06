@@ -80,22 +80,10 @@ pub async fn run<B: AsRef<[u8]>>(
     let req = http::Request::from_parts(parts, ());
     let body: &[u8] = body.as_ref();
 
-    let (fut, mut body_send) = send.send_request(req, body.is_empty())?;
+    let (fut, body_send) = send.send_request(req, body.is_empty())?;
 
     if !body.is_empty() {
-        // send body in reasonable chunks
-        const MAX: usize = 11_111; // odd number just to force weird offsets
-
-        let mut i = 0;
-
-        while i < body.len() {
-            let max = (body.len() - i).min(MAX);
-            body_send = body_send.ready().await?;
-            body_send.send_data(&body[i..(i + max)], false).await?;
-            i += max;
-        }
-
-        body_send.send_data(&[], true).await?;
+        send_body_chunks(body_send, body, 10_000).await?;
     }
 
     let res = fut.await?;
@@ -106,6 +94,28 @@ pub async fn run<B: AsRef<[u8]>>(
     body.read_to_end(&mut v).await?;
 
     Ok((parts, v))
+}
+
+use hreq_h1::SendStream;
+
+/// send body in reasonable chunks
+pub async fn send_body_chunks(
+    mut body_send: SendStream,
+    body: &[u8],
+    size: usize,
+) -> Result<(), Error> {
+    let mut i = 0;
+
+    while i < body.len() {
+        let max = (body.len() - i).min(size);
+        body_send = body_send.ready().await?;
+        body_send.send_data(&body[i..(i + max)], false).await?;
+        i += max;
+    }
+
+    body_send.send_data(&[], true).await?;
+
+    Ok(())
 }
 
 pub async fn run_server<F, R>(mut f: F) -> Result<Connector, io::Error>
@@ -150,6 +160,9 @@ where
                 keep_going = again;
 
                 if !again {
+                    println!("close now");
+                    conn.close().await;
+
                     break;
                 }
             }

@@ -1,3 +1,4 @@
+use crate::client::try_write;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
 use crate::limit::{LimitRead, LimitWrite};
 use crate::Error;
@@ -64,6 +65,22 @@ where
     ) -> Option<Result<(http::Request<RecvStream>, SendResponse), Error>> {
         poll_fn(|cx| Pin::new(&mut *self).poll_accept(cx)).await
     }
+
+    /// Wait until the connection has sent/flush all data and is ok to drop.
+    pub async fn close(mut self) {
+        poll_fn(|cx| Pin::new(&mut self).poll_close(cx)).await;
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let inner = self.0.clone();
+
+        let mut codec = self.0.lock().unwrap();
+
+        // It doesn't matter what the return value is, we just need it to not be pending.
+        ready!(codec.poll_drive(cx, inner.clone()));
+
+        ().into()
+    }
 }
 
 pub struct SendResponse {
@@ -110,6 +127,7 @@ pub(crate) struct Codec {
     state: State,
     // current bytes to be written
     to_write: Vec<u8>,
+    to_write_flush_after: bool,
     // buffer to receive next request into
     request_buf: Vec<u8>,
 }
@@ -158,6 +176,7 @@ impl Codec {
             io: Box::new(IoAdapt(io)),
             state: State::Waiting,
             to_write: vec![],
+            to_write_flush_after: false,
             request_buf: vec![],
         }
     }
@@ -169,7 +188,12 @@ impl Codec {
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         loop {
             // try write any bytes ready to be sent.
-            while self.try_write(cx)? {}
+            while try_write(
+                cx,
+                &mut self.io,
+                &mut self.to_write,
+                &mut self.to_write_flush_after,
+            )? {}
 
             let ret = ready!(self.drive_state(cx, inner.clone()))?;
             match ret {
@@ -182,40 +206,6 @@ impl Codec {
                 }
             }
         }
-    }
-
-    /// Try write outgoing bytes.
-    fn try_write(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        if self.to_write.is_empty() {
-            return Ok(false);
-        }
-
-        trace!("try_write left: {}", self.to_write.len());
-
-        let poll = Pin::new(&mut self.io).poll_write(cx, &self.to_write);
-
-        match poll {
-            Poll::Pending => {
-                // Pending is fine. It means the socket is full upstream, we can still
-                // progress the downstream (i.e. drive_state()).
-                trace!("try_write: Poll::Pending");
-                return Ok(false);
-            }
-
-            // We managed to write some.
-            Poll::Ready(Ok(amount)) => {
-                trace!("try_write did write: {}", amount);
-                // TODO: some more efficient buffer?
-                self.to_write = self.to_write.split_off(amount);
-            }
-
-            Poll::Ready(Err(e)) => {
-                trace!("try_write error: {:?}", e);
-                return Err(e).into();
-            }
-        }
-
-        Ok(true)
     }
 
     fn drive_state(
@@ -368,6 +358,7 @@ impl Codec {
                         write_http1x_res(&res, &mut self.to_write).expect("Write http::Response");
 
                     self.to_write.resize(amount, 0);
+                    self.to_write_flush_after = true;
 
                     // invariant: amount must match written buffer length
                     assert_eq!(self.to_write.len(), amount);
@@ -403,9 +394,11 @@ impl Codec {
             }
 
             State::SendBody(b) => {
-                // if there is a chunk to write, we will wait until it's written.
+                // If there is a chunk to write, we will wait until it's written.
+                // Doing Poll::Pending here is deliberate. Before drive_state() we have
+                // made as much progress in try_write as possible.
                 if !self.to_write.is_empty() {
-                    return Ok(DriveResult::Loop).into();
+                    return Poll::Pending;
                 }
 
                 if b.ended {
@@ -415,13 +408,18 @@ impl Codec {
 
                 let next = ready!(Pin::new(&mut b.rx_body).poll_next(cx));
 
-                if let Some((chunk, end)) = next {
+                if let Some((mut chunk, end)) = next {
                     if end {
                         b.ended = true;
                     }
 
                     // queue up next chunk to write out.
-                    self.to_write = chunk;
+                    if self.to_write.is_empty() {
+                        self.to_write = chunk;
+                    } else {
+                        self.to_write.append(&mut chunk);
+                    }
+                    self.to_write_flush_after = end;
 
                     return Ok(DriveResult::Loop).into();
                 } else {
