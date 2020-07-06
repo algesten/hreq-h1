@@ -454,7 +454,7 @@ where
                         Some((tx_body, limit))
                     };
 
-                    let recv = RecvStream::new(rx_body, None);
+                    let recv = RecvStream::new(rx_body, None, is_no_body);
 
                     let (parts, _) = res.into_parts();
                     let res = http::Response::from_parts(parts, recv);

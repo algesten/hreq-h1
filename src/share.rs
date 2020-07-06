@@ -110,6 +110,12 @@ impl SendStream {
             .poll_flush(cx)
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e)))?;
 
+        // if this is a server, we have just pushed a body chunk and now we
+        // must drive the connection to write it to the socket.
+        if let Some(server_inner) = &this.server_inner {
+            server_inner.poll_drive_external(cx)?;
+        }
+
         Ok(()).into()
     }
 
@@ -140,13 +146,14 @@ impl RecvStream {
     pub(crate) fn new(
         rx_body: mpsc::Receiver<io::Result<Vec<u8>>>,
         server_inner: Option<Arc<Mutex<Codec>>>,
+        ended: bool,
     ) -> Self {
         RecvStream {
             rx_body,
             ready: None,
             index: 0,
             server_inner,
-            ended: false,
+            ended,
         }
     }
 
@@ -161,6 +168,10 @@ impl RecvStream {
         // must drive the connection if server.
         if let Some(server_inner) = &this.server_inner {
             server_inner.poll_drive_external(cx)?;
+        }
+
+        if this.ended {
+            return Ok(0).into();
         }
 
         loop {

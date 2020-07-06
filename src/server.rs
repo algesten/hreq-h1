@@ -82,7 +82,18 @@ impl SendResponse {
 
         let limit = LimitWrite::from_headers(response.headers());
 
-        let ended = limit.is_no_body() || end_of_stream;
+        let status = response.status();
+
+        // https://tools.ietf.org/html/rfc7230#page-31
+        // any response with a 1xx (Informational), 204 (No Content), or
+        // 304 (Not Modified) status code is always terminated by the first
+        // empty line after the header fields, regardless of the header fields
+        // present in the message, and thus cannot contain a message body.
+        let ended = limit.is_no_body()
+            || end_of_stream
+            || status.is_informational()
+            || status == http::StatusCode::NO_CONTENT
+            || status == http::StatusCode::NOT_MODIFIED;
 
         let send = SendStream::new(tx_body, limit, ended, Some(self.inner));
 
@@ -133,6 +144,7 @@ struct BodySender {
     ended: bool,
 }
 
+#[derive(Debug)]
 enum DriveResult {
     /// Next request arrived.
     Request((http::Request<RecvStream>, SendResponse)),
@@ -235,6 +247,12 @@ impl Codec {
                 // Limiter to read the correct body amount from the socket.
                 let limit = LimitRead::from_headers(req.headers(), req.version(), false);
 
+                // https://tools.ietf.org/html/rfc7230#page-31
+                // Any response to a HEAD request ... is always terminated by the first
+                // empty line after the header fields, regardless of the header fields
+                // present in the message, and thus cannot contain a message body.
+                let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
+
                 // bound channel to get backpressure
                 let (tx_body, rx_body) = mpsc::channel(2);
 
@@ -242,7 +260,7 @@ impl Codec {
 
                 // Prepare the new "package" to be delivered out of the poll loop.
                 let package = {
-                    let recv = RecvStream::new(rx_body, Some(inner.clone()));
+                    let recv = RecvStream::new(rx_body, Some(inner.clone()), is_no_body);
 
                     let (parts, _) = req.into_parts();
                     let req = http::Request::from_parts(parts, recv);
@@ -387,7 +405,7 @@ impl Codec {
             State::SendBody(b) => {
                 // if there is a chunk to write, we will wait until it's written.
                 if !self.to_write.is_empty() {
-                    return Poll::Pending;
+                    return Ok(DriveResult::Loop).into();
                 }
 
                 if b.ended {
