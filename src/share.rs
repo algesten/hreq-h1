@@ -48,7 +48,6 @@ impl SendStream {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
-        // must drive the connection if server.
         if let Some(server_inner) = &this.server_inner {
             server_inner.poll_drive_external(cx)?;
         }
@@ -83,7 +82,6 @@ impl SendStream {
             return Err(Error::User("Body data is not expected".into())).into();
         }
 
-        // must drive the connection if server.
         if let Some(server_inner) = &this.server_inner {
             server_inner.poll_drive_external(cx)?;
         }
@@ -106,12 +104,14 @@ impl SendStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
+        if let Some(server_inner) = &this.server_inner {
+            server_inner.poll_drive_external(cx)?;
+        }
+
         ready!(Pin::new(&mut this.tx_body)
             .poll_flush(cx)
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e)))?;
 
-        // if this is a server, we have just pushed a body chunk and now we
-        // must drive the connection to write it to the socket.
         if let Some(server_inner) = &this.server_inner {
             server_inner.poll_drive_external(cx)?;
         }
@@ -120,6 +120,7 @@ impl SendStream {
     }
 
     pub async fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
+        poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await?;
         Ok(())

@@ -160,7 +160,6 @@ where
                 keep_going = again;
 
                 if !again {
-                    println!("close now");
                     conn.close().await;
 
                     break;

@@ -55,7 +55,7 @@ where
 
         let mut lock = this.0.lock().unwrap();
 
-        lock.poll_drive(cx, inner)
+        lock.poll_drive(cx, true, inner)
     }
 
     /// Accept a new incoming request to handle. One must accept new requests continuously
@@ -77,7 +77,7 @@ where
         let mut codec = self.0.lock().unwrap();
 
         // It doesn't matter what the return value is, we just need it to not be pending.
-        ready!(codec.poll_drive(cx, inner.clone()));
+        ready!(codec.poll_drive(cx, true, inner.clone()));
 
         ().into()
     }
@@ -168,6 +168,10 @@ enum DriveResult {
     Request((http::Request<RecvStream>, SendResponse)),
     /// Loop the drive_server again.
     Loop,
+    /// No more requests.
+    Close,
+    /// State is Waiting and want_next_req is false.
+    Waiting,
 }
 
 impl Codec {
@@ -184,6 +188,7 @@ impl Codec {
     pub(crate) fn poll_drive(
         &mut self,
         cx: &mut Context<'_>,
+        want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         loop {
@@ -195,7 +200,7 @@ impl Codec {
                 &mut self.to_write_flush_after,
             )? {}
 
-            let ret = ready!(self.drive_state(cx, inner.clone()))?;
+            let ret = ready!(self.drive_state(cx, want_next_req, inner.clone()))?;
             match ret {
                 DriveResult::Request(p) => {
                     return Poll::Ready(Some(Ok(p)));
@@ -204,6 +209,10 @@ impl Codec {
                 DriveResult::Loop => {
                     continue;
                 }
+
+                DriveResult::Close | DriveResult::Waiting => {
+                    return Poll::Ready(None);
+                }
             }
         }
     }
@@ -211,13 +220,25 @@ impl Codec {
     fn drive_state(
         &mut self,
         cx: &mut Context<'_>,
+        want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
     ) -> Poll<Result<DriveResult, io::Error>> {
         trace!("drive_state: {:?}", self.state);
 
         match &mut self.state {
             State::Waiting => {
-                ready!(poll_for_crlfcrlf(cx, &mut self.request_buf, &mut self.io))?;
+                if !want_next_req {
+                    return Poll::Ready(Ok(DriveResult::Waiting));
+                }
+
+                if let Err(e) = ready!(poll_for_crlfcrlf(cx, &mut self.request_buf, &mut self.io)) {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        trace!("Connection closed");
+                    } else {
+                        trace!("Other error when reading next: {:?}", e);
+                    }
+                    return Poll::Ready(Ok(DriveResult::Close));
+                }
 
                 // we got a full request header in buf
                 self.state = State::RecvReq;
@@ -452,7 +473,7 @@ impl ServerDrive for Arc<Mutex<Codec>> {
 
         let mut lock = self.lock().unwrap();
 
-        match lock.poll_drive(cx, inner) {
+        match lock.poll_drive(cx, false, inner) {
             Poll::Pending => {
                 // this is ok, we have made max progress.const
                 Ok(())
@@ -460,11 +481,13 @@ impl ServerDrive for Arc<Mutex<Codec>> {
 
             Poll::Ready(Some(Err(e))) => Err(e.into_io()),
 
-            x @ _ => {
-                // invariant: any other return state than an error
-                //            should not happen.
-                unreachable!("Unexpected return from poll_drive: {:?}", x)
+            Poll::Ready(Some(Ok(_))) => {
+                // invariant: we must not receive the next request here.
+                unreachable!("Got next request in poll_drive_external")
             }
+
+            // State::Waiting
+            Poll::Ready(None) => Ok(()),
         }
     }
 }
