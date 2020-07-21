@@ -146,7 +146,7 @@ enum State {
 /// State where can both send a response and receive a request body, if appropriate.
 struct Bidirect {
     limit: LimitRead,
-    tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
+    tx_body: Option<mpsc::Sender<io::Result<Vec<u8>>>>,
     tx_body_needs_flush: bool,
     rx_res: oneshot::Receiver<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,
     done_req_body: bool,
@@ -285,7 +285,7 @@ impl Codec {
 
                 self.state = State::SendRes(Bidirect {
                     limit,
-                    tx_body,
+                    tx_body: Some(tx_body),
                     tx_body_needs_flush: false,
                     rx_res,
                     done_req_body,
@@ -301,9 +301,10 @@ impl Codec {
             State::SendRes(h) => {
                 // if the tx_body needs flushing, deal with that first
                 if h.tx_body_needs_flush {
-                    // The RecvStream might be dropped, that's ok.
-                    ready!(Pin::new(&mut h.tx_body).poll_flush(cx)).ok();
-
+                    if let Some(tx_body) = h.tx_body.as_mut() {
+                        // The RecvStream might be dropped, that's ok.
+                        ready!(Pin::new(tx_body).poll_flush(cx)).ok();
+                    }
                     h.tx_body_needs_flush = false;
                 }
 
@@ -311,26 +312,34 @@ impl Codec {
 
                 if !h.done_req_body {
                     if !h.recv_buf.is_empty() {
-                        if let Err(_) = ready!(h.tx_body.poll_ready(cx)) {
-                            // The RecvStream is dropped, that's ok, we continue
-                            // to drive the connection.
-                            trace!("Failed to receive body chunk RecvStream is dropped");
+                        if let Some(tx_body) = h.tx_body.as_mut() {
+                            if let Err(_) = ready!(tx_body.poll_ready(cx)) {
+                                // The RecvStream is dropped, that's ok, we continue
+                                // to drive the connection.
+                                trace!("Failed to receive body chunk RecvStream is dropped");
+                            }
+
+                            let chunk = mem::replace(
+                                &mut h.recv_buf,
+                                Vec::with_capacity(READ_BUF_INIT_SIZE),
+                            );
+
+                            // The RecvStream might be dropped, that's ok.
+                            tx_body.start_send(Ok(chunk)).ok();
+
+                            // As per Sink contract, flush after send.
+                            h.tx_body_needs_flush = true;
+                        } else {
+                            // empty buffer
+                            h.recv_buf = vec![];
+                            h.tx_body_needs_flush = false;
                         }
-
-                        let chunk =
-                            mem::replace(&mut h.recv_buf, Vec::with_capacity(READ_BUF_INIT_SIZE));
-
-                        // The RecvStream might be dropped, that's ok.
-                        h.tx_body.start_send(Ok(chunk)).ok();
-
-                        // As per Sink contract, fush after send.
-                        h.tx_body_needs_flush = true;
                     }
 
                     // invariant: there should be nothing in the buffer now.
                     assert!(h.recv_buf.is_empty());
 
-                    self.request_buf.resize(READ_BUF_INIT_SIZE, 0);
+                    h.recv_buf.resize(READ_BUF_INIT_SIZE, 0);
 
                     match h.limit.poll_read(cx, &mut self.io, &mut h.recv_buf) {
                         Poll::Pending => {
@@ -341,6 +350,13 @@ impl Codec {
                         Poll::Ready(r) => {
                             // read error?
                             let amount = r?;
+
+                            if amount == 0 {
+                                // remove the tx_body to indicate to receiver
+                                // side that no more data is coming.
+                                h.tx_body.take();
+                                h.done_req_body = true;
+                            }
 
                             // size down to read amount.
                             h.recv_buf.resize(amount, 0);
@@ -549,7 +565,7 @@ impl fmt::Debug for State {
             State::RecvReq => write!(f, "RecvReq")?,
             State::SendRes(b) => write!(
                 f,
-                "RecvRes done_req_body: {}, done_response: {}",
+                "SendRes done_req_body: {}, done_response: {}",
                 b.done_req_body, b.done_response
             )?,
             State::SendBody(_) => write!(f, "SendBody")?,

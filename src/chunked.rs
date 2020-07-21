@@ -51,6 +51,7 @@ impl ChunkedDecoder {
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        assert!(!buf.is_empty(), "Chunk read with empty buf");
         loop {
             match self.state {
                 DecoderState::ChunkSize => {
