@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
 futures-io = { version = "0.3", default-features = false, features = ["std"] }
-futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "io"] }
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "io", "sink"] }
 http = "0.2"
 httparse = "1"
 log = "0.4"
