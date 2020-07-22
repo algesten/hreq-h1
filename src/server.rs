@@ -1,5 +1,6 @@
 use crate::client::try_write;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
+use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::Error;
 use crate::RecvStream;
@@ -141,6 +142,8 @@ enum State {
     SendRes(Bidirect),
     /// Send response body.
     SendBody(BodySender),
+    /// Closed
+    Closed,
 }
 
 /// State where can both send a response and receive a request body, if appropriate.
@@ -155,11 +158,13 @@ struct Bidirect {
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
     holder: Option<(bool, LimitWrite, Option<mpsc::Receiver<(Vec<u8>, bool)>>)>,
+    reusable: bool,
 }
 
 struct BodySender {
     rx_body: mpsc::Receiver<(Vec<u8>, bool)>,
     ended: bool,
+    reusable: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +231,10 @@ impl Codec {
         trace!("drive_state: {:?}", self.state);
 
         match &mut self.state {
+            State::Closed => {
+                return Poll::Ready(Ok(DriveResult::Close));
+            }
+
             State::Waiting => {
                 if !want_next_req {
                     return Poll::Ready(Ok(DriveResult::Waiting));
@@ -257,6 +266,8 @@ impl Codec {
 
                 // Limiter to read the correct body amount from the socket.
                 let limit = LimitRead::from_headers(req.headers(), req.version(), false);
+
+                let reusable = allow_reuse(req.headers(), req.version());
 
                 // https://tools.ietf.org/html/rfc7230#page-31
                 // Any response to a HEAD request ... is always terminated by the first
@@ -292,6 +303,7 @@ impl Codec {
                     done_response: false,
                     recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
                     holder: None,
+                    reusable,
                 });
 
                 // Exit drive with the packet.
@@ -411,11 +423,17 @@ impl Codec {
 
                     if end || limit.is_no_body() {
                         // No response body to send.
-                        self.state = State::Waiting;
+                        trace!("Connection is reusable: {}", h.reusable);
+                        self.state = if h.reusable {
+                            State::Waiting
+                        } else {
+                            State::Closed
+                        };
                     } else if let Some(rx_body) = rx_body {
                         self.state = State::SendBody(BodySender {
                             rx_body,
                             ended: false,
+                            reusable: h.reusable,
                         });
                     } else {
                         // invariant: end or limit.is_no_body() means there is no body,
@@ -457,6 +475,16 @@ impl Codec {
                         self.to_write.append(&mut chunk);
                     }
                     self.to_write_flush_after = end;
+
+                    if b.ended && self.to_write.is_empty() {
+                        trace!("Connection is reusable: {}", b.reusable);
+                        self.state = if b.reusable {
+                            State::Waiting
+                        } else {
+                            State::Closed
+                        };
+                        return Ok(DriveResult::Loop).into();
+                    }
 
                     return Ok(DriveResult::Loop).into();
                 } else {
@@ -561,6 +589,7 @@ where
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            State::Closed => write!(f, "Closed")?,
             State::Waiting => write!(f, "Waiting")?,
             State::RecvReq => write!(f, "RecvReq")?,
             State::SendRes(b) => write!(
@@ -568,7 +597,7 @@ impl fmt::Debug for State {
                 "SendRes done_req_body: {}, done_response: {}",
                 b.done_req_body, b.done_response
             )?,
-            State::SendBody(_) => write!(f, "SendBody")?,
+            State::SendBody(b) => write!(f, "SendBody: ended: {}", b.ended)?,
         }
         Ok(())
     }
