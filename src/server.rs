@@ -129,8 +129,8 @@ pub(crate) struct Codec {
     // current bytes to be written
     to_write: Vec<u8>,
     to_write_flush_after: bool,
-    // buffer to receive next request into
-    request_buf: Vec<u8>,
+    // buffer to receive next request into, and then body bytes
+    read_buf: Vec<u8>,
 }
 
 enum State {
@@ -154,7 +154,6 @@ struct Bidirect {
     rx_res: oneshot::Receiver<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,
     done_req_body: bool,
     done_response: bool,
-    recv_buf: Vec<u8>,
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
     holder: Option<(bool, LimitWrite, Option<mpsc::Receiver<(Vec<u8>, bool)>>)>,
@@ -186,7 +185,7 @@ impl Codec {
             state: State::Waiting,
             to_write: vec![],
             to_write_flush_after: false,
-            request_buf: vec![],
+            read_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
         }
     }
 
@@ -240,7 +239,7 @@ impl Codec {
                     return Poll::Ready(Ok(DriveResult::Waiting));
                 }
 
-                if let Err(e) = ready!(poll_for_crlfcrlf(cx, &mut self.request_buf, &mut self.io)) {
+                if let Err(e) = ready!(poll_for_crlfcrlf(cx, &mut self.read_buf, &mut self.io)) {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
                         trace!("Connection closed");
                     } else {
@@ -255,14 +254,13 @@ impl Codec {
 
             State::RecvReq => {
                 // invariant: poll_for_crlfcrlf must have read a full request.
-                let (req, size) =
-                    try_parse_req(&self.request_buf)?.expect("Didn't read full request");
+                let (req, size) = try_parse_req(&self.read_buf)?.expect("Didn't read full request");
 
                 // invariant: entire buffer should have been used up.
-                assert_eq!(self.request_buf.len(), size);
+                assert_eq!(self.read_buf.len(), size);
 
-                // reset for next request
-                self.request_buf.resize(0, 0);
+                // reset for reuse when reading request body.
+                self.read_buf.resize(0, 0);
 
                 // Limiter to read the correct body amount from the socket.
                 let limit = LimitRead::from_headers(req.headers(), req.version(), false);
@@ -301,7 +299,6 @@ impl Codec {
                     rx_res,
                     done_req_body,
                     done_response: false,
-                    recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
                     holder: None,
                     reusable,
                 });
@@ -323,7 +320,7 @@ impl Codec {
                 let mut req_body_pending = false;
 
                 if !h.done_req_body {
-                    if !h.recv_buf.is_empty() {
+                    if !self.read_buf.is_empty() {
                         if let Some(tx_body) = h.tx_body.as_mut() {
                             if let Err(_) = ready!(tx_body.poll_ready(cx)) {
                                 // The RecvStream is dropped, that's ok, we continue
@@ -331,10 +328,8 @@ impl Codec {
                                 trace!("Failed to receive body chunk RecvStream is dropped");
                             }
 
-                            let chunk = mem::replace(
-                                &mut h.recv_buf,
-                                Vec::with_capacity(READ_BUF_INIT_SIZE),
-                            );
+                            let chunk =
+                                mem::replace(&mut self.read_buf, vec![0; READ_BUF_INIT_SIZE]);
 
                             // The RecvStream might be dropped, that's ok.
                             tx_body.start_send(Ok(chunk)).ok();
@@ -343,17 +338,17 @@ impl Codec {
                             h.tx_body_needs_flush = true;
                         } else {
                             // empty buffer
-                            h.recv_buf = vec![];
+                            self.read_buf.resize(0, 0);
                             h.tx_body_needs_flush = false;
                         }
                     }
 
                     // invariant: there should be nothing in the buffer now.
-                    assert!(h.recv_buf.is_empty());
+                    assert!(self.read_buf.is_empty());
 
-                    h.recv_buf.resize(READ_BUF_INIT_SIZE, 0);
+                    self.read_buf.resize(READ_BUF_INIT_SIZE, 0);
 
-                    match h.limit.poll_read(cx, &mut self.io, &mut h.recv_buf) {
+                    match h.limit.poll_read(cx, &mut self.io, &mut self.read_buf) {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
                             req_body_pending = true;
@@ -371,7 +366,7 @@ impl Codec {
                             }
 
                             // size down to read amount.
-                            h.recv_buf.resize(amount, 0);
+                            self.read_buf.resize(amount, 0);
 
                             // loop to send off what was used received.
                             return Ok(DriveResult::Loop).into();
@@ -425,6 +420,7 @@ impl Codec {
                         // No response body to send.
                         trace!("Connection is reusable: {}", h.reusable);
                         self.state = if h.reusable {
+                            self.read_buf.resize(0, 0);
                             State::Waiting
                         } else {
                             State::Closed
@@ -479,6 +475,7 @@ impl Codec {
                     if b.ended && self.to_write.is_empty() {
                         trace!("Connection is reusable: {}", b.reusable);
                         self.state = if b.reusable {
+                            self.read_buf.resize(0, 0);
                             State::Waiting
                         } else {
                             State::Closed
