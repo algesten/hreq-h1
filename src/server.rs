@@ -1,3 +1,61 @@
+//! Server implementation of the HTTP/1.1 protocol.
+//!
+//! # Example
+//!
+//! # Example
+//!
+//! ```rust, no_run
+//! use hreq_h1::server;
+//! use std::error::Error;
+//! use async_std::net::TcpListener;
+//! use http::{Response, StatusCode};
+//!
+//! #[async_std::main]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!     let mut listener = TcpListener::bind("127.0.0.1:3000").await?;
+//!
+//!     // Accept all incoming TCP connections.
+//!     loop {
+//!         if let Ok((socket, _peer_addr)) = listener.accept().await {
+//!
+//!             // Spawn a new task to process each connection individually
+//!             async_std::task::spawn(async move {
+//!                 let mut h1 = server::handshake(socket);
+//!
+//!                 // Handle incoming requests from this socket, one by one.
+//!                 while let Some(request) = h1.accept().await {
+//!                     let (req, mut respond) = request.unwrap();
+//!
+//!                     println!("Receive request: {:?}", req);
+//!
+//!                     // Build a response with no body, since
+//!                     // that is sent later.
+//!                     let response = Response::builder()
+//!                         .status(StatusCode::OK)
+//!                         .body(())
+//!                         .unwrap();
+//!
+//!                     // Send the response back to the client
+//!                     let send_body = respond
+//!                         .send_response(response, false).unwrap();
+//!
+//!                     // For big bodies, we would alternate we get flow
+//!                     // control by alternating between ready/send_data
+//!                     // in a loop.
+//!                     let mut send_body = send_body.ready()
+//!                         .await.unwrap();
+//!                     send_body.send_data(b"Hello world!", true)
+//!                         .await.unwrap();
+//!                 }
+//!             });
+//!         }
+//!     }
+//!
+//!    Ok(())
+//! }
+//!
+//!
+
 use crate::client::try_write;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
 use crate::limit::allow_reuse;
@@ -28,7 +86,7 @@ const MAX_RESPONSE_SIZE: usize = 8192;
 
 /// "handshake" to create a connection.
 ///
-/// This call is a bit odd, but it's to mirror the h2 crate.
+/// See [module level doc](index.html) for an example.
 pub fn handshake<S>(io: S) -> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -37,6 +95,8 @@ where
 }
 
 /// Server connection for accepting incoming requests.
+///
+/// See [module level doc](index.html) for an example.
 //
 // NB: The PhantomData here is to maintain API parity with h2. Keeping Connection generic over <S>
 // gives us a future option to make a better impl that doesn't hide the IO behind a Box<dyn trait>.
@@ -84,6 +144,9 @@ where
     }
 }
 
+/// Handle to send a response and body back for a single request.
+///
+/// See [module level doc](index.html) for an example.
 pub struct SendResponse {
     inner: Arc<Mutex<Codec>>,
     tx_res: oneshot::Sender<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,

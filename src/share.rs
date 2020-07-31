@@ -158,6 +158,7 @@ impl RecvStream {
         }
     }
 
+    #[doc(hidden)]
     /// Poll for some body data.
     pub fn poll_body_data(
         self: Pin<&mut Self>,
@@ -213,11 +214,17 @@ impl RecvStream {
         }
     }
 
+    /// Read some body data into a given buffer.
+    ///
+    /// Ends when returned size is `0`.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
     }
 
-    pub fn is_end(&self) -> bool {
+    /// Returns `true` if there is no more data to receive.
+    ///
+    /// Specifically any further call to `read` will result in `0` bytes read.
+    pub fn is_end_stream(&self) -> bool {
         self.ended
     }
 }

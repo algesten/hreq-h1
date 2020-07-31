@@ -1,3 +1,67 @@
+//! Client implementation of the HTTP/1.1 protocol.
+//!
+//! The client connection is split into two parts, one [`Connection`], which
+//! encapsulates the actual transport, and a [`SendRequest`] which is used
+//! to send (multiple) requests over the connection.
+//!
+//! # Example
+//!
+//! ```rust, no_run
+//! use hreq_h1::client;
+//! use std::error::Error;
+//! use async_std::net::TcpStream;
+//! use http::Request;
+//!
+//! #[async_std::main]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!   // Establish TCP connection to the server.
+//!   let tcp = TcpStream::connect("127.0.0.1:5928").await?;
+//!
+//!   // h1 is the API handle to send requests
+//!   let (mut h1, connection) = client::handshake(tcp);
+//!
+//!   // Drive the connection independently of the API handle
+//!   async_std::task::spawn(async move {
+//!     if let Err(e) = connection.await {
+//!       println!("Connection closed: {:?}", e);
+//!     }
+//!   });
+//!
+//!   // POST request to. Note that body is sent below.
+//!   let req = Request::post("http://myspecial.server/recv")
+//!     .body(())?;
+//!
+//!   let (res, send_body) = h1.send_request(req, false)?;
+//!
+//!   // Before we send body, make sure it's ready to be received.
+//!   // If we have a big body, this is done in a loop to get
+//!   // flow control.
+//!   let mut send_body = send_body.ready().await?;
+//!   send_body.send_data(b"This is the request body data", true).await?;
+//!
+//!   let (head, mut body) = res.await?.into_parts();
+//!
+//!   println!("Received response: {:?}", head);
+//!
+//!   // Read response body into this buffer.
+//!   let mut buf = [0_u8; 1024];
+//!   loop {
+//!      let amount = body.read(&mut buf).await?;
+//!
+//!      println!("RX: {:?}", &buf[0..amount]);
+//!
+//!      if amount == 0 {
+//!        break;
+//!      }
+//!   }
+//!
+//!   Ok(())
+//! }
+//! ```
+//!
+//! [`Connection`]: struct.Connection.html
+//! [`SendRequest`]: struct.SendRequest.html
+
 use crate::err_closed;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req};
 use crate::limit::allow_reuse;
@@ -26,6 +90,8 @@ const MAX_REQUEST_SIZE: usize = 8192;
 ///
 /// Returns a handle to send requests and a connection tuple. The connection
 /// is a future that must be polled to "drive" the client forward.
+///
+/// See [module level doc](index.html) for an example.
 pub fn handshake<S>(io: S) -> (SendRequest, Connection<S>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -40,6 +106,8 @@ where
 }
 
 /// Sender of new requests.
+///
+/// See [module level doc](index.html) for an example.
 #[derive(Clone)]
 pub struct SendRequest {
     req_tx: mpsc::Sender<Handle>,
@@ -130,6 +198,9 @@ impl Future for ResponseFuture {
     }
 }
 
+/// Future that manages the actual connection. Must be awaited to "drive" the connection.
+///
+/// See [module level doc](index.html) for an example.
 pub struct Connection<S>(Codec<S>);
 
 impl<S> Future for Connection<S>
