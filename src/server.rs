@@ -406,9 +406,6 @@ impl Codec {
                         }
                     }
 
-                    // invariant: there should be nothing in the buffer now.
-                    assert!(self.read_buf.is_empty());
-
                     self.read_buf.resize(READ_BUF_INIT_SIZE, 0);
 
                     match h.limit.poll_read(cx, &mut self.io, &mut self.read_buf) {
