@@ -297,7 +297,7 @@ struct Bidirect {
     /// Buffer to read response into.
     response_buf: Vec<u8>,
     /// Whether the response version + headers allow connection reuse.
-    response_allow_reuse: bool,
+    allow_reuse: bool,
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
     holder: Option<(mpsc::Sender<io::Result<Vec<u8>>>, LimitRead)>,
@@ -310,6 +310,7 @@ struct BodyReceiver {
     tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
     tx_body_needs_flush: bool,
     recv_buf: Vec<u8>,
+    allow_reuse: bool,
 }
 
 impl<S> Codec<S>
@@ -400,6 +401,9 @@ where
                 self.to_write.resize(amount, 0);
                 self.to_write_flush_after = true;
 
+                // see if the request allows for reuse.
+                let allow_reuse = allow_reuse(h.req.headers(), h.req.version());
+
                 // if we don't expect a request body, we mark the next state as being
                 // done for send body already.
                 let done_req_body = h.no_send_body;
@@ -411,7 +415,7 @@ where
                     done_req_body,
                     done_response: false,
                     response_buf: vec![],
-                    response_allow_reuse: false,
+                    allow_reuse,
                     holder: None,
                 });
             }
@@ -466,9 +470,11 @@ where
                     //            try_parse_res should not be able to get a partial response.
                     let (res, size) = res.expect("Parsed partial response");
 
-                    // this is used when there is no response body and we have no limiter to
-                    // decice whether to reuse the connection.
-                    b.response_allow_reuse = allow_reuse(res.headers(), res.version());
+                    // the allow_reuse flag will be false if request was sent with connection: close.
+                    if b.allow_reuse {
+                        // request allowed reused, now check if response does.
+                        b.allow_reuse = allow_reuse(res.headers(), res.version());
+                    }
 
                     // invariant: all bytes should have been used up
                     assert_eq!(b.response_buf.len(), size);
@@ -530,6 +536,9 @@ where
                     // https://tools.ietf.org/html/rfc7230#page-33
 
                     if let Some((tx_body, limit)) = b.holder.take() {
+                        // carry flag over
+                        let allow_reuse = b.allow_reuse;
+
                         // expect a response body.
                         let handle = self.state.take_handle();
 
@@ -539,10 +548,11 @@ where
                             tx_body_needs_flush: false,
                             limit,
                             recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
+                            allow_reuse,
                         });
                     } else {
                         // expect no response body.
-                        if b.response_allow_reuse {
+                        if b.allow_reuse {
                             // we can reuse connection
                             trace!("Reuse connection");
                             self.state = State::Waiting;
@@ -626,7 +636,7 @@ where
                         return Err(io::Error::new(EOF, "Partial body")).into();
                     }
 
-                    if r.limit.is_reusable() {
+                    if r.allow_reuse && r.limit.is_reusable() {
                         // No more response body. ready to handle next request.
                         // NB. This drops the r.tx_body which means the RecvStream will
                         // read a 0 amount on next try.
