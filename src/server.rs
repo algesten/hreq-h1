@@ -481,6 +481,12 @@ impl Codec {
 
                     let limit = LimitWrite::from_headers(res.headers());
 
+                    // server can send connection: close
+                    let allow_reuse = allow_reuse(res.headers(), res.version());
+                    if h.reusable && !allow_reuse {
+                        h.reusable = false;
+                    }
+
                     h.holder = Some((end, limit, rx_body));
                 }
 
