@@ -1,4 +1,4 @@
-use futures_util::AsyncWriteExt;
+use futures_util::{AsyncReadExt, AsyncWriteExt};
 use hreq_h1::Error;
 
 mod common;
@@ -11,7 +11,11 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
 
         assert_eq!(&body.unwrap(), b"OK\n");
 
-        let res = http::Response::builder().body(()).unwrap();
+        let res = http::Response::builder()
+            .header("content-length", "0")
+            .header("connection", "close")
+            .body(())
+            .unwrap();
 
         respond.send_response(res, true).unwrap();
 
@@ -25,7 +29,15 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
         .await?;
 
     let head = common::read_header(&mut tcp).await?;
-    assert_eq!(head, "HTTP/1.1 200 OK\r\n\r\n");
+    assert_eq!(
+        head,
+        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+
+    let mut buf = [0_u8; 1];
+    if let Some(read) = tcp.read(&mut buf).await.ok() {
+        assert_eq!(read, 0);
+    }
 
     Ok(())
 }
@@ -38,7 +50,11 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
 
         assert_eq!(&body.unwrap(), b"OK\n");
 
-        let res = http::Response::builder().body(()).unwrap();
+        let res = http::Response::builder()
+            .header("content-length", "0")
+            .header("connection", "close")
+            .body(())
+            .unwrap();
 
         respond.send_response(res, true).unwrap();
 
@@ -54,7 +70,15 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
     .await?;
 
     let head = common::read_header(&mut tcp).await?;
-    assert_eq!(head, "HTTP/1.1 200 OK\r\n\r\n");
+    assert_eq!(
+        head,
+        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+
+    let mut buf = [0_u8; 1];
+    if let Some(read) = tcp.read(&mut buf).await.ok() {
+        assert_eq!(read, 0);
+    }
 
     Ok(())
 }
@@ -93,10 +117,7 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
             )
             .expect("send_response");
 
-        for _ in 0..10 {
-            send_body = send_body.ready().await.unwrap();
-            send_body.send_data(b"OK", false).await.unwrap();
-        }
+        send_body.send_data(&[], true).await.unwrap();
     });
 
     let conn = Connector(addr);
@@ -110,6 +131,16 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
         head,
         "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
     );
+
+    let mut buf = [0_u8; 5];
+    tcp.read(&mut buf).await?;
+
+    assert_eq!(&buf, b"0\r\n\r\n");
+
+    let mut buf = [0_u8; 1];
+    if let Some(read) = tcp.read(&mut buf).await.ok() {
+        assert_eq!(read, 0);
+    }
 
     Ok(())
 }

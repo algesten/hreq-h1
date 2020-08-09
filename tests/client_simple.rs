@@ -137,12 +137,18 @@ async fn post_big_body_chunked() -> Result<(), Error> {
         let mut total = 0;
         let mut buf = vec![0_u8; 8192];
         let cmp = vec![42_u8; 8192];
-        while total < 10485760 {
+        loop {
             let amount = decode.read(&mut tcp, &mut buf).await?;
+
+            if amount == 0 {
+                break;
+            }
 
             assert_eq!(&buf[0..amount], &cmp[0..amount]);
 
             total += amount;
+
+            assert!(total <= 10 * 1024 * 1024);
         }
 
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
