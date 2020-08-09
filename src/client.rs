@@ -440,6 +440,7 @@ where
 
                             // Sender signalled end of stream
                             if end {
+                                trace!("done_req_body (end): true");
                                 b.done_req_body = true;
                             }
 
@@ -449,6 +450,7 @@ where
 
                         Poll::Ready(None) => {
                             // No more body chunks to be expected, SendBody was dropped.
+                            trace!("done_req_body (None): true");
                             b.done_req_body = true;
                         }
                     }
@@ -471,6 +473,7 @@ where
                     assert_eq!(b.response_buf.len(), size);
 
                     // we have a response for sure.
+                    trace!("done_response: true");
                     b.done_response = true;
 
                     let limit = LimitRead::from_headers(res.headers(), res.version(), true);
@@ -573,7 +576,6 @@ where
                     if let Err(_) = ready!(r.tx_body.poll_ready(cx)) {
                         // Receiver is gone. We continue receving to get
                         // connection in a good state for next request.
-                        trace!("Failed to receive body chunk RecvStream is dropped");
                     }
 
                     let chunk =
@@ -581,10 +583,10 @@ where
 
                     // Since we poll_ready above, the error here is that the receiver is gone,
                     // which isn't a problem.
-                    r.tx_body.start_send(Ok(chunk)).ok();
+                    let needs_flush = r.tx_body.start_send(Ok(chunk)).is_ok();
 
                     // As per the Sink contract, flush after start_send()
-                    r.tx_body_needs_flush = true;
+                    r.tx_body_needs_flush = needs_flush;
 
                     // loop
                     return Ok(true).into();
@@ -706,7 +708,7 @@ pub(crate) fn try_write<S: AsyncWrite + Unpin>(
             trace!("try_write did write: {}", amount);
             // TODO: some more efficient buffer?
             let remain = to_write.split_off(amount);
-            mem::replace(to_write, remain);
+            *to_write = remain;
         }
 
         Poll::Ready(Err(e)) => {

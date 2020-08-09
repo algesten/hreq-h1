@@ -6,7 +6,7 @@ mod common;
 #[async_std::test]
 async fn server_request_with_body_clen() -> Result<(), Error> {
     let conn = common::run_server(|parts, body, respond, _| async move {
-        assert_eq!(parts.method, "GET");
+        assert_eq!(parts.method, "POST");
         assert_eq!(parts.uri.path(), "/path");
 
         assert_eq!(&body.unwrap(), b"OK\n");
@@ -21,7 +21,7 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
 
     let mut tcp = conn.connect().await?;
 
-    tcp.write_all(b"GET /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
+    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
         .await?;
 
     let head = common::read_header(&mut tcp).await?;
@@ -33,7 +33,7 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
 #[async_std::test]
 async fn server_request_with_body_chunked() -> Result<(), Error> {
     let conn = common::run_server(|parts, body, respond, _| async move {
-        assert_eq!(parts.method, "GET");
+        assert_eq!(parts.method, "POST");
         assert_eq!(parts.uri.path(), "/path");
 
         assert_eq!(&body.unwrap(), b"OK\n");
@@ -49,12 +49,67 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
     let mut tcp = conn.connect().await?;
 
     tcp.write_all(
-        b"GET /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
+        b"POST /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
     )
     .await?;
 
     let head = common::read_header(&mut tcp).await?;
     assert_eq!(head, "HTTP/1.1 200 OK\r\n\r\n");
+
+    Ok(())
+}
+
+#[async_std::test]
+async fn server_request_with_body_dropped() -> Result<(), Error> {
+    common::setup_logger();
+
+    use async_std::net::TcpListener;
+    use common::Connector;
+
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let p = l.local_addr().unwrap().port();
+    let addr = format!("127.0.0.1:{}", p);
+
+    async_std::task::spawn(async move {
+        let (tcp, _) = l.accept().await.expect("Accept incoming");
+
+        let mut conn = hreq_h1::server::handshake(tcp);
+
+        let (req, respond) = conn.accept().await.unwrap().expect("Handshaken");
+
+        let (_, recv_body) = req.into_parts();
+
+        // this is what we're testing, dropping the recv_body, ignoring the incoming
+        // request body and then send a response anyway.
+        drop(recv_body);
+
+        let mut send_body = respond
+            .send_response(
+                http::Response::builder()
+                    .header("transfer-encoding", "chunked")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .expect("send_response");
+
+        for _ in 0..10 {
+            send_body = send_body.ready().await.unwrap();
+            send_body.send_data(b"OK", false).await.unwrap();
+        }
+    });
+
+    let conn = Connector(addr);
+    let mut tcp = conn.connect().await?;
+
+    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
+        .await?;
+
+    let head = common::read_header(&mut tcp).await?;
+    assert_eq!(
+        head,
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
+    );
 
     Ok(())
 }

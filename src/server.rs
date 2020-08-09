@@ -387,18 +387,24 @@ impl Codec {
                         if let Some(tx_body) = h.tx_body.as_mut() {
                             if let Err(_) = ready!(tx_body.poll_ready(cx)) {
                                 // The RecvStream is dropped, that's ok, we continue
-                                // to drive the connection.
-                                trace!("Failed to receive body chunk RecvStream is dropped");
+                                // to drive the connection. Specifically we need
+                                // to still exhaust the entire body to ensure
+                                // the socket can be reused for a new request.
                             }
 
-                            let chunk =
-                                mem::replace(&mut self.read_buf, vec![0; READ_BUF_INIT_SIZE]);
+                            let chunk = mem::replace(
+                                &mut self.read_buf,
+                                Vec::with_capacity(READ_BUF_INIT_SIZE),
+                            );
 
                             // The RecvStream might be dropped, that's ok.
-                            tx_body.start_send(Ok(chunk)).ok();
+                            let needs_flush = tx_body.start_send(Ok(chunk)).is_ok();
 
                             // As per Sink contract, flush after send.
-                            h.tx_body_needs_flush = true;
+                            h.tx_body_needs_flush = needs_flush;
+
+                            // loop to send off what was used received.
+                            return Ok(DriveResult::Loop).into();
                         } else {
                             // empty buffer
                             self.read_buf.resize(0, 0);
@@ -411,10 +417,13 @@ impl Codec {
                     match h.limit.poll_read(cx, &mut self.io, &mut self.read_buf) {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
+                            trace!("Read req_body: Pending");
                             req_body_pending = true;
                         }
 
                         Poll::Ready(r) => {
+                            trace!("Read req_body: Ready ({:?})", r);
+
                             // read error?
                             let amount = r?;
 
@@ -422,6 +431,7 @@ impl Codec {
                                 // remove the tx_body to indicate to receiver
                                 // side that no more data is coming.
                                 h.tx_body.take();
+                                trace!("done_req_body: true");
                                 h.done_req_body = true;
                             }
 
@@ -450,6 +460,7 @@ impl Codec {
                     };
 
                     // got a response now.
+                    trace!("done_response: true");
                     h.done_response = true;
 
                     // invariant: there should be nothing to send now.
