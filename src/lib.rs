@@ -54,7 +54,7 @@
 //! [`server::handshake`]: server/fn.handshake.html
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 mod error;
 mod limit;

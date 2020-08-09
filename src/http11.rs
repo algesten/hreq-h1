@@ -77,12 +77,10 @@ pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
 
     // write buffer to connection
     let buf = w.into_inner();
-    if log_enabled!(log::Level::Debug) {
-        debug!(
-            "write_http11_req: {:?}",
-            String::from_utf8_lossy(&buf[0..len])
-        );
-    }
+    debug!(
+        "write_http11_req: {:?}",
+        String::from_utf8_lossy(&buf[0..len])
+    );
 
     Ok(len)
 }
@@ -119,12 +117,10 @@ pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usiz
 
     // write buffer to connection
     let buf = w.into_inner();
-    if log_enabled!(log::Level::Debug) {
-        debug!(
-            "write_http11_res: {:?}",
-            String::from_utf8_lossy(&buf[0..len])
-        );
-    }
+    debug!(
+        "write_http11_res: {:?}",
+        String::from_utf8_lossy(&buf[0..len])
+    );
 
     Ok(len)
 }
@@ -139,9 +135,7 @@ fn version_of(v: Option<u8>) -> http::Version {
 
 /// Attempt to parse an http/1.1 response.
 pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, io::Error> {
-    if log_enabled!(log::Level::Trace) {
-        trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
-    }
+    trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut parser = httparse::Response::new(&mut headers);
@@ -187,9 +181,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
 
 /// Attempt to parse an http/1.1 request.
 pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, io::Error> {
-    if log_enabled!(log::Level::Trace) {
-        trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
-    }
+    trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut parser = httparse::Request::new(&mut headers);
