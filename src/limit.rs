@@ -145,6 +145,11 @@ impl ContentLengthRead {
 
         let left = (self.limit - self.total).min(usize::max_value() as u64) as usize;
 
+        if left == 0 {
+            // Nothing more should be read.
+            return Ok(0).into();
+        }
+
         let max = buf.len().min(left);
         let amount = ready!(Pin::new(&mut *recv).poll_read(cx, &mut buf[0..max]))?;
 
