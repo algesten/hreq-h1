@@ -56,6 +56,7 @@ extern crate log;
 mod error;
 mod limit;
 mod share;
+mod try_write;
 
 #[doc(hidden)]
 pub mod http11;

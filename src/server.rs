@@ -56,10 +56,10 @@
 //!
 //!
 
-use crate::client::try_write;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
+use crate::try_write::try_write;
 use crate::Error;
 use crate::RecvStream;
 use crate::SendStream;
