@@ -102,7 +102,7 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
     let conn = Connector(addr);
     let mut tcp = conn.connect().await?;
 
-    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
+    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
         .await?;
 
     let head = common::read_header(&mut tcp).await?;

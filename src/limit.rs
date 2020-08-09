@@ -76,10 +76,11 @@ impl LimitRead {
     }
 
     pub fn is_no_body(&self) -> bool {
-        if let ReadLimiter::NoBody = &self.limiter {
-            return true;
+        match &self.limiter {
+            ReadLimiter::ContentLength(r) => r.limit == 0,
+            ReadLimiter::NoBody => true,
+            _ => false,
         }
-        false
     }
 
     pub fn is_complete(&self) -> bool {
@@ -245,10 +246,11 @@ impl LimitWrite {
     }
 
     pub fn is_no_body(&self) -> bool {
-        if let LimitWrite::NoBody = self {
-            return true;
+        match self {
+            LimitWrite::ContentLength(w) => w.limit == 0,
+            LimitWrite::NoBody => true,
+            _ => false,
         }
-        false
     }
 
     /// Write some data using this limiter.
