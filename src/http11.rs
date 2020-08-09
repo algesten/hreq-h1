@@ -248,7 +248,11 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, i
 /// Helper to poll for request or response.
 ///
 /// It looks out for \r\n\r\n, which indicates the end of the headers and body begins.
-pub fn poll_for_crlfcrlf<S>(cx: &mut Context, buf: &mut Vec<u8>, io: &mut S) -> Poll<io::Result<()>>
+pub fn poll_for_crlfcrlf<S>(
+    cx: &mut Context<'_>,
+    buf: &mut Vec<u8>,
+    io: &mut S,
+) -> Poll<io::Result<()>>
 where
     S: AsyncRead + Unpin,
 {

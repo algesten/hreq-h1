@@ -662,3 +662,21 @@ impl fmt::Debug for State {
         Ok(())
     }
 }
+
+impl fmt::Debug for SendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SendRequest")
+    }
+}
+
+impl fmt::Debug for ResponseFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ResponseFuture")
+    }
+}
+
+impl<S> fmt::Debug for Connection<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Connection")
+    }
+}

@@ -47,7 +47,7 @@ impl ChunkedDecoder {
 
     pub fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
@@ -102,7 +102,7 @@ impl ChunkedDecoder {
     // 3\r\nhel\r\nb\r\nlo world!!!\r\n0\r\n\r\n
     fn poll_chunk_size<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
     ) -> Poll<io::Result<()>> {
         // read until we get a non-numeric character. this could be
@@ -166,7 +166,7 @@ impl ChunkedDecoder {
     // skip until we get a \n
     fn poll_skip_until_lf<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
     ) -> Poll<io::Result<()>> {
         // skip until we get a \n
@@ -188,7 +188,7 @@ impl ChunkedDecoder {
     }
 }
 
-pub struct ChunkedEncoder;
+pub(crate) struct ChunkedEncoder;
 
 impl ChunkedEncoder {
     pub fn write_chunk(buf: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {

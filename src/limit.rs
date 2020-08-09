@@ -106,7 +106,7 @@ impl LimitRead {
     /// Try read some data.
     pub fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
@@ -137,7 +137,7 @@ impl ContentLengthRead {
 
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
@@ -189,7 +189,7 @@ impl ReadToEnd {
 
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         recv: &mut R,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {

@@ -153,6 +153,7 @@ pub struct SendResponse {
 }
 
 impl SendResponse {
+    /// Send a response to a request. Notice that the body is sent separately afterwards.
     pub fn send_response(
         self,
         response: http::Response<()>,
@@ -668,5 +669,11 @@ impl fmt::Debug for State {
             State::SendBody(b) => write!(f, "SendBody: ended: {}", b.ended)?,
         }
         Ok(())
+    }
+}
+
+impl<S> std::fmt::Debug for Connection<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", "Connection")
     }
 }

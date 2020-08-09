@@ -45,7 +45,7 @@ impl SendStream {
     }
 
     /// Poll for whether this connection is ready to send more data without blocking.
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         if let Some(server_inner) = &this.server_inner {
@@ -72,7 +72,7 @@ impl SendStream {
     /// to send more data after `end` is `true`.
     fn poll_send_data(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         data: &[u8],
         end: bool,
     ) -> Poll<Result<(), Error>> {
@@ -101,7 +101,7 @@ impl SendStream {
         Ok(()).into()
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         if let Some(server_inner) = &this.server_inner {
@@ -119,6 +119,15 @@ impl SendStream {
         Ok(()).into()
     }
 
+    /// Send one chunk of data. Use `end` to signal end of data.
+    ///
+    /// Alternate calls to this with calls to `ready` for flow control.
+    ///
+    /// When the body is constrained by a `content-length` header, this will only accept
+    /// the amount of bytes specified in the header. If there is too much data, the
+    /// function will error with a `Error::User`.
+    ///
+    /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
     pub async fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
         poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await?;
@@ -162,7 +171,7 @@ impl RecvStream {
     /// Poll for some body data.
     pub fn poll_body_data(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();

@@ -1,4 +1,7 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 #![warn(clippy::all)]
+
 //! An asynchronous HTTP/1 server and client implemenation.
 //!
 //! This library provides the lower level parts of the HTTP/1.1 (and 1.0) spec.
