@@ -1,4 +1,4 @@
-use crate::AsyncRead;
+use crate::AsyncBufRead;
 use crate::Error;
 use futures_util::ready;
 use http::header::{HeaderName, HeaderValue};
@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 // As applications use more cookies and user agents expand features,
 // typical header sizes of 700-800 bytes is common.
 // http://dev.chromium.org/spdy/spdy-whitepaper
+/// Size of buffer reading response body into.
+pub(crate) const READ_BUF_INIT_SIZE: usize = 16_384;
 
 /// Write an http/1.1 request to a buffer.
 #[allow(clippy::write_with_newline)]
@@ -135,7 +137,7 @@ fn version_of(v: Option<u8>) -> http::Version {
 
 /// Attempt to parse an http/1.1 response.
 #[instrument(skip(buf))]
-pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, io::Error> {
+pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error> {
     trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -173,16 +175,16 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
         .body(())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let len = status.unwrap();
+    // let len = status.unwrap();
 
     debug!("try_parse_http11 success: {:?}", built);
 
-    Ok(Some((built, len)))
+    Ok(Some(built))
 }
 
 /// Attempt to parse an http/1.1 request.
 #[instrument(skip(buf))]
-pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, io::Error> {
+pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error> {
     trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -232,68 +234,72 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, i
         .body(())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let len = status.unwrap();
+    // let used_len = status.unwrap();
 
     debug!("try_parse_http11 success: {:?}", built);
 
-    Ok(Some((built, len)))
+    Ok(Some(built))
 }
 
 /// Helper to poll for request or response.
 ///
 /// It looks out for \r\n\r\n, which indicates the end of the headers and body begins.
-pub fn poll_for_crlfcrlf<S>(
-    cx: &mut Context<'_>,
-    buf: &mut Vec<u8>,
-    io: &mut S,
-) -> Poll<io::Result<()>>
+pub fn poll_for_crlfcrlf<S, F, T>(cx: &mut Context, io: &mut S, f: F) -> Poll<io::Result<T>>
 where
-    S: AsyncRead + Unpin,
+    S: AsyncBufRead + Unpin,
+    F: FnOnce(&[u8]) -> T,
+    T: std::fmt::Debug,
 {
     const END_OF_HEADER: &[u8] = &[b'\r', b'\n', b'\r', b'\n'];
-    let mut end_index = 0;
-    let mut buf_index = 0;
-    let mut one = [0_u8; 1];
+    let mut end_index = 0; // index into END_OF_HEADER
 
-    // fix so end_index is where it needs to be
-    loop {
-        if buf_index == buf.len() {
-            break;
-        }
-        if buf[buf_index] == END_OF_HEADER[end_index] {
-            end_index += 1;
-        } else if end_index > 0 {
-            end_index = 0;
-        }
-        buf_index += 1;
-    }
+    let mut buf_index = 0; // index into buf
 
     loop {
-        if buf_index == buf.len() {
-            // read one more char
-            let amount = ready!(Pin::new(&mut &mut *io).poll_read(cx, &mut one[..]))?;
-            if amount == 0 {
+        let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx))?;
+
+        // buffer did not grow. that means end_of_file in underlying reader.
+        if buf.len() == buf_index {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF before complete http11 header",
+            ))
+            .into();
+        }
+
+        loop {
+            if end_index == END_OF_HEADER.len() {
+                // we found the end of the request/response header
+
+                // convert to whatever caller wants.
+                let ret = f(&buf[0..buf_index]);
+
+                // discard the amount used from buffer.
+                Pin::new(&mut *io).consume(buf_index);
+
+                return Ok(ret).into();
+            }
+
+            if buf_index == READ_BUF_INIT_SIZE {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "EOF before complete http11 header",
+                    io::ErrorKind::InvalidData,
+                    format!("No header found in {} bytes", READ_BUF_INIT_SIZE),
                 ))
                 .into();
             }
-            buf.push(one[0]);
-        }
 
-        if buf[buf_index] == END_OF_HEADER[end_index] {
-            end_index += 1;
-        } else if end_index > 0 {
-            end_index = 0;
-        }
+            if buf_index == buf.len() {
+                // must fill more.
+                break;
+            }
 
-        if end_index == END_OF_HEADER.len() {
-            // we found the end of header sequence
-            break;
+            if buf[buf_index] == END_OF_HEADER[end_index] {
+                end_index += 1;
+            } else if end_index > 0 {
+                end_index = 0;
+            }
+
+            buf_index += 1;
         }
-        buf_index += 1;
     }
-
-    Ok(()).into()
 }

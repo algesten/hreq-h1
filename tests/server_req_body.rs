@@ -1,4 +1,5 @@
 use futures_util::{AsyncReadExt, AsyncWriteExt};
+use hreq_h1::buf_reader::BufReader;
 use hreq_h1::Error;
 
 mod common;
@@ -23,19 +24,20 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
     })
     .await?;
 
-    let mut tcp = conn.connect().await?;
+    let tcp = conn.connect().await?;
+    let mut brd = BufReader::new(tcp);
 
-    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
+    brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
         .await?;
 
-    let head = common::read_header(&mut tcp).await?;
+    let head = common::read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
     );
 
     let mut buf = [0_u8; 1];
-    if let Some(read) = tcp.read(&mut buf).await.ok() {
+    if let Some(read) = brd.read(&mut buf).await.ok() {
         assert_eq!(read, 0);
     }
 
@@ -62,21 +64,22 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
     })
     .await?;
 
-    let mut tcp = conn.connect().await?;
+    let tcp = conn.connect().await?;
+    let mut brd = BufReader::new(tcp);
 
-    tcp.write_all(
+    brd.write_all(
         b"POST /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
     )
     .await?;
 
-    let head = common::read_header(&mut tcp).await?;
+    let head = common::read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
     );
 
     let mut buf = [0_u8; 1];
-    if let Some(read) = tcp.read(&mut buf).await.ok() {
+    if let Some(read) = brd.read(&mut buf).await.ok() {
         assert_eq!(read, 0);
     }
 
@@ -121,24 +124,25 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
     });
 
     let conn = Connector(addr);
-    let mut tcp = conn.connect().await?;
+    let tcp = conn.connect().await?;
+    let mut brd = BufReader::new(tcp);
 
-    tcp.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
+    brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
         .await?;
 
-    let head = common::read_header(&mut tcp).await?;
+    let head = common::read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
     );
 
     let mut buf = [0_u8; 5];
-    tcp.read(&mut buf).await?;
+    brd.read(&mut buf).await?;
 
     assert_eq!(&buf, b"0\r\n\r\n");
 
     let mut buf = [0_u8; 1];
-    if let Some(read) = tcp.read(&mut buf).await.ok() {
+    if let Some(read) = brd.read(&mut buf).await.ok() {
         assert_eq!(read, 0);
     }
 

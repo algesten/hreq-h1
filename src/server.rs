@@ -56,7 +56,8 @@
 //!
 //!
 
-use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res};
+use crate::buf_reader::BufReader;
+use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::try_write::try_write;
@@ -65,6 +66,7 @@ use crate::RecvStream;
 use crate::SendStream;
 use crate::{AsyncRead, AsyncWrite};
 use futures_channel::{mpsc, oneshot};
+use futures_io::AsyncBufRead;
 use futures_util::future::poll_fn;
 use futures_util::ready;
 use futures_util::sink::Sink;
@@ -77,9 +79,6 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-
-/// Size of buffer reading request body into.
-const READ_BUF_INIT_SIZE: usize = 16_384;
 
 /// Buffer size when writing a request.
 const MAX_RESPONSE_SIZE: usize = 8192;
@@ -109,7 +108,7 @@ where
     #[instrument(skip(self, cx))]
     fn poll_accept(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         let this = self.get_mut();
 
@@ -133,7 +132,7 @@ where
         poll_fn(|cx| Pin::new(&mut self).poll_close(cx)).await;
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let inner = self.0.clone();
 
         let mut codec = self.0.lock().unwrap();
@@ -213,7 +212,7 @@ enum State {
     /// Waiting for the next request.
     Waiting,
     /// Receive request.
-    RecvReq,
+    RecvReq(Option<http::Request<()>>),
     /// Send response, and (if appropriate) receive request body.
     SendRes(Bidirect),
     /// Send response body.
@@ -257,7 +256,7 @@ enum DriveResult {
 impl Codec {
     fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: S) -> Self {
         Codec {
-            io: Box::new(IoAdapt(io)),
+            io: Box::new(IoAdapt(BufReader::with_capacity(READ_BUF_INIT_SIZE, io))),
             state: State::Waiting,
             to_write: vec![],
             to_write_flush_after: false,
@@ -268,7 +267,7 @@ impl Codec {
     #[instrument(skip(self, cx, want_next_req, inner, pending_on_waiting))]
     pub(crate) fn poll_drive(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
         pending_on_waiting: bool,
@@ -309,7 +308,7 @@ impl Codec {
 
     fn drive_state(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
     ) -> Poll<Result<DriveResult, io::Error>> {
@@ -325,26 +324,33 @@ impl Codec {
                     return Poll::Ready(Ok(DriveResult::Waiting));
                 }
 
-                if let Err(e) = ready!(poll_for_crlfcrlf(cx, &mut self.read_buf, &mut self.io)) {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        trace!("Connection closed");
-                    } else {
-                        trace!("Other error when reading next: {:?}", e);
-                    }
-                    return Poll::Ready(Ok(DriveResult::Close));
-                }
+                match ready!(poll_for_crlfcrlf(cx, &mut self.io, try_parse_req)) {
+                    Ok(res) => {
+                        // unwrap error from failing to parse request header.
+                        let req = res?;
 
-                // we got a full request header in buf
-                trace!("Waiting => RecvReq");
-                self.state = State::RecvReq;
+                        // invariant: poll_for_crlfcrlf must have read a full request.
+                        let req = req.expect("Didn't read full request");
+
+                        // we got a full request header in buf
+                        trace!("Waiting => RecvReq");
+                        self.state = State::RecvReq(Some(req));
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::UnexpectedEof {
+                            trace!("Connection closed");
+                        } else {
+                            trace!("Other error when reading next: {:?}", e);
+                        }
+                        trace!("Waiting => Closed");
+                        self.state = State::Closed;
+                        return Poll::Ready(Ok(DriveResult::Close));
+                    }
+                }
             }
 
-            State::RecvReq => {
-                // invariant: poll_for_crlfcrlf must have read a full request.
-                let (req, size) = try_parse_req(&self.read_buf)?.expect("Didn't read full request");
-
-                // invariant: entire buffer should have been used up.
-                assert_eq!(self.read_buf.len(), size);
+            State::RecvReq(req) => {
+                let req = req.take().expect("No request for RecvReq");
 
                 // reset for reuse when reading request body.
                 self.read_buf.resize(0, 0);
@@ -626,11 +632,11 @@ impl Codec {
 // ***************** Helper to drive connection externally *************************
 
 pub(crate) trait ServerDrive {
-    fn poll_drive_external(&self, cx: &mut Context<'_>) -> Result<(), io::Error>;
+    fn poll_drive_external(&self, cx: &mut Context) -> Result<(), io::Error>;
 }
 
 impl ServerDrive for Arc<Mutex<Codec>> {
-    fn poll_drive_external(&self, cx: &mut Context<'_>) -> Result<(), io::Error> {
+    fn poll_drive_external(&self, cx: &mut Context) -> Result<(), io::Error> {
         let inner = self.clone();
 
         // this shouldn't really have any contention.
@@ -663,11 +669,11 @@ impl fmt::Debug for SendResponse {
 
 // ***************** Boiler plate to hide IO behind a Box<dyn trait> ***************
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+trait Io: AsyncBufRead + AsyncWrite + Unpin + Send + 'static {}
 
 struct IoAdapt<S>(S);
 
-impl<S> Io for IoAdapt<S> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<S> Io for IoAdapt<S> where S: AsyncBufRead + AsyncWrite + Unpin + Send + 'static {}
 
 impl<S> AsyncRead for IoAdapt<S>
 where
@@ -675,7 +681,7 @@ where
 {
     fn poll_read(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
@@ -683,23 +689,33 @@ where
     }
 }
 
+impl<S> AsyncBufRead for IoAdapt<S>
+where
+    S: AsyncBufRead + AsyncWrite + Unpin,
+{
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.0).poll_fill_buf(cx)
+    }
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        Pin::new(&mut this.0).consume(amt)
+    }
+}
+
 impl<S> AsyncWrite for IoAdapt<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         Pin::new(&mut this.0).poll_write(cx, buf)
     }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.0).poll_flush(cx)
     }
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.0).poll_close(cx)
     }
@@ -710,7 +726,7 @@ impl fmt::Debug for State {
         match self {
             State::Closed => write!(f, "Closed")?,
             State::Waiting => write!(f, "Waiting")?,
-            State::RecvReq => write!(f, "RecvReq")?,
+            State::RecvReq(_) => write!(f, "RecvReq")?,
             State::SendRes(b) => write!(
                 f,
                 "SendRes done_req_body: {}, done_response: {}",

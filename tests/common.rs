@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use async_std::net::{TcpListener, TcpStream};
-use futures_io::AsyncRead;
+use futures_io::AsyncBufRead;
 use futures_util::future::poll_fn;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
+use hreq_h1::buf_reader::BufReader;
 use hreq_h1::server::SendResponse;
 use hreq_h1::Error;
 use std::future::Future;
@@ -14,8 +15,8 @@ use std::sync::Once;
 pub async fn serve<F, R>(mut f: F) -> Result<Connector, io::Error>
 where
     F: Send + 'static,
-    F: FnMut(String, TcpStream, usize) -> R,
-    R: Future<Output = Result<(TcpStream, bool), Error>>,
+    F: FnMut(String, BufReader<TcpStream>, usize) -> R,
+    R: Future<Output = Result<(BufReader<TcpStream>, bool), Error>>,
     R: Send,
 {
     setup_logger();
@@ -25,10 +26,11 @@ where
 
     async_std::task::spawn(async move {
         let mut call_count = 1;
-        let (mut tcp, _) = l.accept().await.expect("Accept failed");
+        let (tcp, _) = l.accept().await.expect("Accept failed");
+        let mut brd = BufReader::new(tcp);
 
         loop {
-            let head = match read_header(&mut tcp).await {
+            let head = match read_header(&mut brd).await {
                 Ok(v) => v,
                 Err(_e) => {
                     // client closed the connection
@@ -36,12 +38,12 @@ where
                 }
             };
 
-            let fut = f(head, tcp, call_count);
+            let fut = f(head, brd, call_count);
 
-            let (tcp_ret, again) = fut.await.expect("Handler fail");
-            tcp = tcp_ret;
+            let (brd_ret, again) = fut.await.expect("Handler fail");
+            brd = brd_ret;
 
-            tcp.flush().await.expect("Flush fail");
+            brd.flush().await.expect("Flush fail");
 
             call_count += 1;
 
@@ -171,10 +173,11 @@ where
     Ok(Connector(addr))
 }
 
-pub async fn read_header<S: AsyncRead + Unpin>(io: &mut S) -> Result<String, Error> {
-    let mut buf = vec![];
-    poll_fn(|cx| hreq_h1::http11::poll_for_crlfcrlf(cx, &mut buf, io)).await?;
-    Ok(String::from_utf8(buf).unwrap())
+pub async fn read_header<S: AsyncBufRead + Unpin>(io: &mut S) -> Result<String, Error> {
+    Ok(poll_fn(|cx| {
+        hreq_h1::http11::poll_for_crlfcrlf(cx, io, |buf| String::from_utf8(buf.to_vec()).unwrap())
+    })
+    .await?)
 }
 
 pub fn setup_logger() {

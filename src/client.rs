@@ -62,8 +62,9 @@
 //! [`Connection`]: struct.Connection.html
 //! [`SendRequest`]: struct.SendRequest.html
 
+use crate::buf_reader::BufReader;
 use crate::err_closed;
-use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req};
+use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::try_write::try_write;
@@ -80,9 +81,6 @@ use std::io;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-/// Size of buffer reading response body into.
-const READ_BUF_INIT_SIZE: usize = 16_384;
 
 /// Buffer size when writing a request.
 const MAX_REQUEST_SIZE: usize = 8192;
@@ -186,7 +184,7 @@ pub struct ResponseFuture(oneshot::Receiver<io::Result<http::Response<RecvStream
 impl Future for ResponseFuture {
     type Output = Result<http::Response<RecvStream>, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         let res = ready!(Pin::new(&mut this.0).poll(cx));
@@ -213,14 +211,14 @@ where
 {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.0.poll_drive(cx)
     }
 }
 
 struct Codec<S> {
-    io: S,
+    io: BufReader<S>,
     req_rx: mpsc::Receiver<Handle>,
     to_write: Vec<u8>,
     to_write_flush_after: bool,
@@ -297,8 +295,6 @@ struct Bidirect {
     done_req_body: bool,
     /// If we are finished receiving the response.
     done_response: bool,
-    /// Buffer to read response into.
-    response_buf: Vec<u8>,
     /// Whether the response version + headers allow connection reuse.
     allow_reuse: bool,
     /// Placeholder used if we received a response but are not finished
@@ -322,7 +318,7 @@ where
 {
     fn new(io: S, req_rx: mpsc::Receiver<Handle>) -> Self {
         Codec {
-            io,
+            io: BufReader::with_capacity(READ_BUF_INIT_SIZE, io),
             req_rx,
             to_write: Vec::with_capacity(MAX_REQUEST_SIZE),
             to_write_flush_after: false,
@@ -331,7 +327,7 @@ where
     }
 
     #[instrument(skip(self, cx))]
-    fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_drive(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
             // first try to write queued outgoing bytes until it is pending or empty,
             while try_write(
@@ -369,7 +365,7 @@ where
         Ok(()).into()
     }
 
-    fn drive_state(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    fn drive_state(&mut self, cx: &mut Context) -> Poll<io::Result<bool>> {
         trace!("drive_state: {:?}", self.state);
 
         match &mut self.state {
@@ -419,7 +415,6 @@ where
                     handle,
                     done_req_body,
                     done_response: false,
-                    response_buf: vec![],
                     allow_reuse,
                     holder: None,
                 });
@@ -470,22 +465,17 @@ where
                 }
 
                 if !b.done_response {
-                    ready!(poll_for_crlfcrlf(cx, &mut b.response_buf, &mut self.io))?;
-
-                    let res = try_parse_res(&b.response_buf)?;
+                    let res = ready!(poll_for_crlfcrlf(cx, &mut self.io, try_parse_res))??;
 
                     // invariant: poll_for_crlfcrlf should provide a full header and
                     //            try_parse_res should not be able to get a partial response.
-                    let (res, size) = res.expect("Parsed partial response");
+                    let res = res.expect("Parsed partial response");
 
                     // the allow_reuse flag will be false if request was sent with connection: close.
                     if b.allow_reuse {
                         // request allowed reused, now check if response does.
                         b.allow_reuse = allow_reuse(res.headers(), res.version());
                     }
-
-                    // invariant: all bytes should have been used up
-                    assert_eq!(b.response_buf.len(), size);
 
                     // we have a response for sure.
                     trace!("done_response: true");

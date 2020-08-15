@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 /// Helper used in both cliend and server
 #[instrument(skip(cx, io, to_write, to_write_flush_after))]
 pub(crate) fn try_write<S: AsyncWrite + Unpin>(
-    cx: &mut Context<'_>,
+    cx: &mut Context,
     io: &mut S,
     to_write: &mut Vec<u8>,
     to_write_flush_after: &mut bool,

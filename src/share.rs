@@ -46,7 +46,7 @@ impl SendStream {
 
     /// Poll for whether this connection is ready to send more data without blocking.
     #[instrument(skip(self, cx))]
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         if let Some(server_inner) = &this.server_inner {
@@ -76,7 +76,7 @@ impl SendStream {
     #[instrument(skip(self, cx, data, end))]
     fn poll_send_data(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         data: &[u8],
         end: bool,
     ) -> Poll<Result<(), Error>> {
@@ -106,7 +106,7 @@ impl SendStream {
     }
 
     #[instrument(skip(self, cx))]
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         if let Some(server_inner) = &this.server_inner {
@@ -179,7 +179,7 @@ impl RecvStream {
     #[instrument(skip(self, cx, buf))]
     pub fn poll_body_data(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
@@ -250,7 +250,7 @@ impl RecvStream {
 impl AsyncRead for RecvStream {
     fn poll_read(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         self.poll_body_data(cx, buf)
