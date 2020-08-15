@@ -143,7 +143,7 @@ where
 
             let mut conn = hreq_h1::server::handshake(tcp);
 
-            for x in conn.accept().await {
+            while let Some(x) = conn.accept().await {
                 let (req, respond) = x.expect("Handshaken");
 
                 let (parts, mut body) = req.into_parts();
