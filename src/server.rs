@@ -57,6 +57,7 @@
 //!
 
 use crate::buf_reader::BufReader;
+use crate::buf_reader::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
@@ -75,7 +76,6 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-use std::mem;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -205,7 +205,7 @@ pub(crate) struct Codec {
     to_write: Vec<u8>,
     to_write_flush_after: bool,
     // buffer to receive next request into, and then body bytes
-    read_buf: Vec<u8>,
+    read_buf: FastBuf,
 }
 
 enum State {
@@ -260,7 +260,7 @@ impl Codec {
             state: State::Waiting,
             to_write: vec![],
             to_write_flush_after: false,
-            read_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
+            read_buf: FastBuf::with_capacity(READ_BUF_INIT_SIZE),
         }
     }
 
@@ -352,9 +352,6 @@ impl Codec {
             State::RecvReq(req) => {
                 let req = req.take().expect("No request for RecvReq");
 
-                // reset for reuse when reading request body.
-                self.read_buf.resize(0, 0);
-
                 // Limiter to read the correct body amount from the socket.
                 let limit = LimitRead::from_headers(req.headers(), req.version(), false);
 
@@ -434,10 +431,7 @@ impl Codec {
                             }
                             drop(_enter);
 
-                            let chunk = mem::replace(
-                                &mut self.read_buf,
-                                Vec::with_capacity(READ_BUF_INIT_SIZE),
-                            );
+                            let chunk = self.read_buf.take_vec();
 
                             // The RecvStream might be dropped, that's ok.
                             let needs_flush = tx_body.start_send(Ok(chunk)).is_ok();
@@ -451,16 +445,17 @@ impl Codec {
                         } else {
                             // tx_body is gone, empty buffer
                             trace!("tx_body not present, drop chunk");
-                            self.read_buf.resize(0, 0);
+                            self.read_buf.empty();
                             h.tx_body_needs_flush = false;
                         }
                     }
 
-                    self.read_buf.resize(READ_BUF_INIT_SIZE, 0);
+                    // When ref drops, buffer is resized.
+                    let mut read_into = self.read_buf.borrow();
 
                     let span = trace_span!("limit.poll_read");
                     let _enter = span.enter();
-                    match h.limit.poll_read(cx, &mut self.io, &mut self.read_buf) {
+                    match h.limit.poll_read(cx, &mut self.io, &mut read_into) {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
                             trace!("Read req_body: Pending");
@@ -481,8 +476,7 @@ impl Codec {
                                 h.done_req_body = true;
                             }
 
-                            // size down to read amount.
-                            self.read_buf.resize(amount, 0);
+                            read_into.add_len(amount);
 
                             // loop to send off what we received.
                             return Ok(DriveResult::Loop).into();
@@ -542,10 +536,12 @@ impl Codec {
                     // invariant: We can't be here without sending a response..
                     let (end, limit, rx_body) = h.holder.take().expect("Missing holder");
 
+                    // invariant: read_buf must been used up now.
+                    assert!(self.read_buf.is_empty());
+
                     if end || limit.is_no_body() {
                         // No response body to send.
                         self.state = if h.reusable {
-                            self.read_buf.resize(0, 0);
                             trace!("SendRes => Waiting");
                             State::Waiting
                         } else {
@@ -581,7 +577,6 @@ impl Codec {
                 }
 
                 if b.ended {
-                    trace!("Ended by status or headers");
                     self.state = if b.reusable {
                         trace!("SendBody => Waiting");
                         State::Waiting
@@ -611,9 +606,7 @@ impl Codec {
                     self.to_write_flush_after = end;
 
                     if b.ended && self.to_write.is_empty() {
-                        trace!("Ended by send_data end_of_body");
                         self.state = if b.reusable {
-                            self.read_buf.resize(0, 0);
                             trace!("SendBody => Waiting");
                             State::Waiting
                         } else {

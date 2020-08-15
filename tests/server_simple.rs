@@ -26,7 +26,7 @@ async fn server_request_200_ok() -> Result<(), Error> {
     .await?;
 
     let tcp = conn.connect().await?;
-    let mut brd = BufReader::new(tcp);
+    let mut brd = BufReader::with_capacity(8192, tcp);
 
     brd.write_all(b"GET /path HTTP/1.1\r\n\r\n").await?;
 
@@ -68,7 +68,7 @@ async fn server_big_body_clen() -> Result<(), Error> {
     .await?;
 
     let tcp = conn.connect().await?;
-    let mut brd = BufReader::new(tcp);
+    let mut brd = BufReader::with_capacity(8192, tcp);
 
     brd.write_all(b"GET /path HTTP/1.1\r\n\r\n").await?;
 

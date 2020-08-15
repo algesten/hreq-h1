@@ -27,7 +27,7 @@ where
     async_std::task::spawn(async move {
         let mut call_count = 1;
         let (tcp, _) = l.accept().await.expect("Accept failed");
-        let mut brd = BufReader::new(tcp);
+        let mut brd = BufReader::with_capacity(16_384, tcp);
 
         loop {
             let head = match read_header(&mut brd).await {
