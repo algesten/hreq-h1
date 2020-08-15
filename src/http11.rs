@@ -16,6 +16,7 @@ pub(crate) const READ_BUF_INIT_SIZE: usize = 16_384;
 
 /// Write an http/1.1 request to a buffer.
 #[allow(clippy::write_with_newline)]
+#[instrument(skip(req, buf))]
 pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
@@ -89,6 +90,7 @@ pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
 
 /// Write an http/1.x response to a buffer.
 #[allow(clippy::write_with_newline)]
+#[instrument(skip(res, buf))]
 pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);

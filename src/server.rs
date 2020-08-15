@@ -410,6 +410,8 @@ impl Codec {
                 if h.tx_body_needs_flush {
                     trace!("tx_body needs flush");
                     if let Some(tx_body) = h.tx_body.as_mut() {
+                        let span = trace_span!("tx_body.poll_flush");
+                        let _enter = span.enter();
                         // The RecvStream might be dropped, that's ok.
                         ready!(Pin::new(tx_body).poll_flush(cx)).ok();
                     }
@@ -421,6 +423,8 @@ impl Codec {
                 if !h.done_req_body {
                     if !self.read_buf.is_empty() {
                         if let Some(tx_body) = h.tx_body.as_mut() {
+                            let span = trace_span!("tx_body.poll_ready");
+                            let _enter = span.enter();
                             trace!("tx_body try send chunk");
                             if let Err(_) = ready!(tx_body.poll_ready(cx)) {
                                 // The RecvStream is dropped, that's ok, we continue
@@ -428,6 +432,7 @@ impl Codec {
                                 // to still exhaust the entire body to ensure
                                 // the socket can be reused for a new request.
                             }
+                            drop(_enter);
 
                             let chunk = mem::replace(
                                 &mut self.read_buf,
@@ -453,6 +458,8 @@ impl Codec {
 
                     self.read_buf.resize(READ_BUF_INIT_SIZE, 0);
 
+                    let span = trace_span!("limit.poll_read");
+                    let _enter = span.enter();
                     match h.limit.poll_read(cx, &mut self.io, &mut self.read_buf) {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
@@ -484,6 +491,8 @@ impl Codec {
                 }
 
                 if !h.done_response {
+                    let span = trace_span!("rx_res.poll");
+                    let _enter = span.enter();
                     let (res, end, rx_body) = match ready!(Pin::new(&mut h.rx_res).poll(cx)) {
                         Ok((res, end, rx_body)) => (res, end, Some(rx_body)),
                         Err(_) => {
@@ -497,6 +506,7 @@ impl Codec {
                             )
                         }
                     };
+                    drop(_enter);
 
                     // got a response now.
                     trace!("done_response: true");
@@ -582,7 +592,10 @@ impl Codec {
                     return Ok(DriveResult::Loop).into();
                 }
 
+                let span = trace_span!("rx_body.poll");
+                let _enter = span.enter();
                 let next = ready!(Pin::new(&mut b.rx_body).poll_next(cx));
+                drop(_enter);
 
                 if let Some((mut chunk, end)) = next {
                     if end {
