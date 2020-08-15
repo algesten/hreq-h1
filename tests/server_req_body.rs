@@ -17,7 +17,7 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
             .body(())
             .unwrap();
 
-        respond.send_response(res, true).unwrap();
+        respond.send_response(res, false).unwrap();
 
         Ok(false)
     })
@@ -56,7 +56,7 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
             .body(())
             .unwrap();
 
-        respond.send_response(res, true).unwrap();
+        respond.send_response(res, false).unwrap();
 
         Ok(false)
     })

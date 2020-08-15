@@ -45,6 +45,7 @@ impl ChunkedDecoder {
         Ok(poll_fn(|cx| self.poll_read(cx, recv, buf)).await?)
     }
 
+    #[instrument(skip(self, cx, recv, buf))]
     pub fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
@@ -191,6 +192,7 @@ impl ChunkedDecoder {
 pub(crate) struct ChunkedEncoder;
 
 impl ChunkedEncoder {
+    #[instrument(skip(out))]
     pub fn write_chunk(buf: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         let mut cur = io::Cursor::new(out);
         let header = format!("{:x}\r\n", buf.len()).into_bytes();
@@ -200,6 +202,7 @@ impl ChunkedEncoder {
         cur.write_all(CRLF)?;
         Ok(())
     }
+    #[instrument(skip(out))]
     pub fn write_finish(out: &mut Vec<u8>) -> Result<(), Error> {
         const END: &[u8] = b"0\r\n\r\n";
         let mut cur = io::Cursor::new(out);

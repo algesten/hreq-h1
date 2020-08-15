@@ -134,18 +134,21 @@ impl SendRequest {
     /// The nature of HTTP/1 means only one request can be sent at a time (no multiplexing).
     /// Each request sent before the next has finished will be queued.
     ///
-    /// The `end` argument indiciates there is no body to be sent. The returned `SendStream`
-    /// will accept body data unless `end` is `true`.
+    /// The `no_body` argument indiciates there is no body to be sent. The returned `SendStream`
+    /// will not accept data if `no_body` is true.
     ///
     /// Errors if the connection is closed.
+    #[instrument(skip(self, req, no_body))]
     pub fn send_request(
         &mut self,
         req: http::Request<()>,
-        end: bool,
+        no_body: bool,
     ) -> Result<(ResponseFuture, SendStream), Error> {
         if req.method() == http::Method::CONNECT {
             return Err(Error::User("hreq-h1 does not support CONNECT".into()));
         }
+
+        trace!("Send request: {:?}", req);
 
         // Channel to send response back.
         let (res_tx, res_rx) = oneshot::channel();
@@ -155,7 +158,7 @@ impl SendRequest {
 
         let limit = LimitWrite::from_headers(req.headers());
 
-        let no_send_body = end || limit.is_no_body();
+        let no_send_body = no_body || limit.is_no_body();
 
         // The handle for the codec/connection.
         let next = Handle {
@@ -327,6 +330,7 @@ where
         }
     }
 
+    #[instrument(skip(self, cx))]
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             // first try to write queued outgoing bytes until it is pending or empty,
@@ -379,7 +383,7 @@ where
                 let next = ready!(Pin::new(&mut self.req_rx).poll_next(cx));
 
                 if let Some(h) = next {
-                    trace!("Send next");
+                    trace!("Waiting => SendReq");
                     self.state = State::SendReq(h);
                 } else {
                     // sender has closed, no more requests to come
@@ -410,6 +414,7 @@ where
 
                 let handle = self.state.take_handle();
 
+                trace!("SendReq => RecvRes");
                 self.state = State::RecvRes(Bidirect {
                     handle,
                     done_req_body,
@@ -421,19 +426,22 @@ where
             }
 
             State::RecvRes(b) => {
+                // This state does two things. It both sends a request body (if indicated by
+                // headers) at the same time as receiving a response.
+
                 let mut req_body_pending = false;
 
                 if !b.done_req_body {
                     // Not done sending a request body. Try get a body chunk to send.
                     match Pin::new(&mut b.handle.rx_body).poll_next(cx) {
                         Poll::Pending => {
-                            trace!("No body chunk to send");
                             // Pending is ok, it means the SendBody has not sent any chunk.
+                            trace!("Read req_body: Pending");
                             req_body_pending = true;
                         }
 
                         Poll::Ready(Some((mut chunk, end))) => {
-                            trace!("Got body chunk len: {}, end: {}", chunk.len(), end);
+                            trace!("Read req_body len: {}, end: {}", chunk.len(), end);
 
                             // Got a chunk to send
                             if self.to_write.is_empty() {
@@ -542,6 +550,7 @@ where
                         // expect a response body.
                         let handle = self.state.take_handle();
 
+                        trace!("RecvRes => RecvBody");
                         self.state = State::RecvBody(BodyReceiver {
                             handle,
                             tx_body,
@@ -554,7 +563,7 @@ where
                         // expect no response body.
                         if b.allow_reuse {
                             // we can reuse connection
-                            trace!("Reuse connection");
+                            trace!("RecvRes => Waiting (expect no body)");
                             self.state = State::Waiting;
                         } else {
                             // drop connection
@@ -576,6 +585,7 @@ where
             State::RecvBody(r) => {
                 // if the tx_body needs flushing, deal with that first
                 if r.tx_body_needs_flush {
+                    trace!("tx_body needs flush");
                     // if the flushing fails, the receiver is gone, that's ok.
                     ready!(Pin::new(&mut r.tx_body).poll_flush(cx)).ok();
 
@@ -583,6 +593,7 @@ where
                 }
 
                 if !r.recv_buf.is_empty() {
+                    trace!("tx_body try send chunk");
                     // we got a chunk read to send off to the RecvStream
                     if let Err(_) = ready!(r.tx_body.poll_ready(cx)) {
                         // Receiver is gone. We continue receving to get
@@ -596,6 +607,7 @@ where
                     // which isn't a problem.
                     let needs_flush = r.tx_body.start_send(Ok(chunk)).is_ok();
 
+                    trace!("tx_body chunk sent");
                     // As per the Sink contract, flush after start_send()
                     r.tx_body_needs_flush = needs_flush;
 
@@ -611,8 +623,9 @@ where
 
                 // read self.io through the limiter to stop reading when we are
                 // in place for the next request.
-                let amount = ready!(r.limit.poll_read(cx, &mut self.io, &mut r.recv_buf))?;
-                trace!("Response body read: {}", amount);
+                let res = ready!(r.limit.poll_read(cx, &mut self.io, &mut r.recv_buf));
+                trace!("Read res_body: ({:?})", res);
+                let amount = res?;
 
                 if amount > 0 {
                     // scale down buffer to read amount and loop to send off.
@@ -640,7 +653,7 @@ where
                         // No more response body. ready to handle next request.
                         // NB. This drops the r.tx_body which means the RecvStream will
                         // read a 0 amount on next try.
-                        trace!("Reuse connection");
+                        trace!("RecvBody => Waiting");
                         self.state = State::Waiting;
                     } else {
                         // This connection can not be reused, could for instance be http/1.0

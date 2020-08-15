@@ -134,6 +134,7 @@ fn version_of(v: Option<u8>) -> http::Version {
 }
 
 /// Attempt to parse an http/1.1 response.
+#[instrument(skip(buf))]
 pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, io::Error> {
     trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
 
@@ -180,6 +181,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<(http::Response<()>, usize)>, 
 }
 
 /// Attempt to parse an http/1.1 request.
+#[instrument(skip(buf))]
 pub fn try_parse_req(buf: &[u8]) -> Result<Option<(http::Request<()>, usize)>, io::Error> {
     trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
 

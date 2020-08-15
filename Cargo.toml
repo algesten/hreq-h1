@@ -17,6 +17,7 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 http = "0.2"
 httparse = "1"
 tracing = "0.1"
+tracing-futures = "0.2"
 
 [dev-dependencies]
 async-std = { version = "1", features = ["attributes"] }

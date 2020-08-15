@@ -106,6 +106,7 @@ impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    #[instrument(skip(self, cx))]
     fn poll_accept(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -154,10 +155,18 @@ pub struct SendResponse {
 
 impl SendResponse {
     /// Send a response to a request. Notice that the body is sent separately afterwards.
+    ///
+    /// The lib will infer that there will be no response body if there is a `content-length: 0`
+    /// header or a status code that should not have a body (1xx, 204, 304).
+    ///
+    /// `no_body` is an alternative way, in addition to headers and status, to inform the library
+    /// there will be no body to send.
+    ///
+    /// It's an error to send a body when the status or headers indicate there should not be one.
     pub fn send_response(
         self,
         response: http::Response<()>,
-        end_of_stream: bool,
+        no_body: bool,
     ) -> Result<SendStream, Error> {
         // bounded to get back pressure
         let (tx_body, rx_body) = mpsc::channel(2);
@@ -171,8 +180,8 @@ impl SendResponse {
         // 304 (Not Modified) status code is always terminated by the first
         // empty line after the header fields, regardless of the header fields
         // present in the message, and thus cannot contain a message body.
-        let ended = limit.is_no_body()
-            || end_of_stream
+        let ended = no_body
+            || limit.is_no_body()
             || status.is_informational()
             || status == http::StatusCode::NO_CONTENT
             || status == http::StatusCode::NOT_MODIFIED;
@@ -253,6 +262,7 @@ impl Codec {
         }
     }
 
+    #[instrument(skip(self, cx, want_next_req, inner))]
     pub(crate) fn poll_drive(
         &mut self,
         cx: &mut Context<'_>,
@@ -313,6 +323,7 @@ impl Codec {
                 }
 
                 // we got a full request header in buf
+                trace!("Waiting => RecvReq");
                 self.state = State::RecvReq;
             }
 
@@ -356,6 +367,7 @@ impl Codec {
 
                 let done_req_body = limit.is_no_body();
 
+                trace!("RecvReq => SendRes");
                 self.state = State::SendRes(Bidirect {
                     limit,
                     tx_body: Some(tx_body),
@@ -372,8 +384,13 @@ impl Codec {
             }
 
             State::SendRes(h) => {
+                // This state does two things, it both waits for the user of the lib
+                // to send a response at the same time as attempting to receive
+                // a request body (if headers indicate it).
+
                 // if the tx_body needs flushing, deal with that first
                 if h.tx_body_needs_flush {
+                    trace!("tx_body needs flush");
                     if let Some(tx_body) = h.tx_body.as_mut() {
                         // The RecvStream might be dropped, that's ok.
                         ready!(Pin::new(tx_body).poll_flush(cx)).ok();
@@ -386,6 +403,7 @@ impl Codec {
                 if !h.done_req_body {
                     if !self.read_buf.is_empty() {
                         if let Some(tx_body) = h.tx_body.as_mut() {
+                            trace!("tx_body try send chunk");
                             if let Err(_) = ready!(tx_body.poll_ready(cx)) {
                                 // The RecvStream is dropped, that's ok, we continue
                                 // to drive the connection. Specifically we need
@@ -404,10 +422,12 @@ impl Codec {
                             // As per Sink contract, flush after send.
                             h.tx_body_needs_flush = needs_flush;
 
+                            trace!("tx_body chunk sent");
                             // loop to send off what was used received.
                             return Ok(DriveResult::Loop).into();
                         } else {
-                            // empty buffer
+                            // tx_body is gone, empty buffer
+                            trace!("tx_body not present, drop chunk");
                             self.read_buf.resize(0, 0);
                             h.tx_body_needs_flush = false;
                         }
@@ -439,7 +459,7 @@ impl Codec {
                             // size down to read amount.
                             self.read_buf.resize(amount, 0);
 
-                            // loop to send off what was used received.
+                            // loop to send off what we received.
                             return Ok(DriveResult::Loop).into();
                         }
                     }
@@ -496,14 +516,16 @@ impl Codec {
 
                     if end || limit.is_no_body() {
                         // No response body to send.
-                        trace!("Connection is reusable: {}", h.reusable);
                         self.state = if h.reusable {
                             self.read_buf.resize(0, 0);
+                            trace!("SendRes => Waiting");
                             State::Waiting
                         } else {
+                            trace!("SendRes => Closed (not reusable)");
                             State::Closed
                         };
                     } else if let Some(rx_body) = rx_body {
+                        trace!("SendRes => SendBody");
                         self.state = State::SendBody(BodySender {
                             rx_body,
                             ended: false,
@@ -531,7 +553,14 @@ impl Codec {
                 }
 
                 if b.ended {
-                    self.state = State::Waiting;
+                    trace!("Ended by status or headers");
+                    self.state = if b.reusable {
+                        trace!("SendBody => Waiting");
+                        State::Waiting
+                    } else {
+                        trace!("SendBody => Closed (not reusable)");
+                        State::Closed
+                    };
                     return Ok(DriveResult::Loop).into();
                 }
 
@@ -551,11 +580,13 @@ impl Codec {
                     self.to_write_flush_after = end;
 
                     if b.ended && self.to_write.is_empty() {
-                        trace!("Connection is reusable: {}", b.reusable);
+                        trace!("Ended by send_data end_of_body");
                         self.state = if b.reusable {
                             self.read_buf.resize(0, 0);
+                            trace!("SendBody => Waiting");
                             State::Waiting
                         } else {
+                            trace!("SendBody => Closed (not reusable)");
                             State::Closed
                         };
                         return Ok(DriveResult::Loop).into();
@@ -565,7 +596,7 @@ impl Codec {
                 } else {
                     // This is a fault, we are expecting more body chunks and
                     // the SendStream was dropped.
-                    warn!("SendStream dropped before sending all of the expected body");
+                    warn!("SendStream dropped before sending end_of_body");
 
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
@@ -590,6 +621,7 @@ impl ServerDrive for Arc<Mutex<Codec>> {
     fn poll_drive_external(&self, cx: &mut Context<'_>) -> Result<(), io::Error> {
         let inner = self.clone();
 
+        // this shouldn't really have any contention.
         let mut lock = self.lock().unwrap();
 
         match lock.poll_drive(cx, false, inner) {
@@ -605,7 +637,7 @@ impl ServerDrive for Arc<Mutex<Codec>> {
                 unreachable!("Got next request in poll_drive_external")
             }
 
-            // State::Waiting
+            // this is what we want.
             Poll::Ready(None) => Ok(()),
         }
     }
@@ -672,7 +704,7 @@ impl fmt::Debug for State {
                 "SendRes done_req_body: {}, done_response: {}",
                 b.done_req_body, b.done_response
             )?,
-            State::SendBody(b) => write!(f, "SendBody: ended: {}", b.ended)?,
+            State::SendBody(_) => write!(f, "SendBody")?,
         }
         Ok(())
     }

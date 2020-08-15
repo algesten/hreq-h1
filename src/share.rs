@@ -45,6 +45,7 @@ impl SendStream {
     }
 
     /// Poll for whether this connection is ready to send more data without blocking.
+    #[instrument(skip(self, cx))]
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
@@ -60,8 +61,10 @@ impl SendStream {
 
     /// Test whether connection is ready to send more data. The call stalls until
     /// any previous data provided in `send_data()` has been transfered to the remote
-    /// peer (or at least in a buffer). As such, this can form part of a flow control.
+    /// peer (or at least in a buffer). As such, this can form part of flow control.
+    #[instrument(skip(self))]
     pub async fn ready(mut self) -> Result<SendStream, Error> {
+        trace!("Wait until ready for next send_data");
         poll_fn(|cx| Pin::new(&mut self).poll_ready(cx)).await?;
         Ok(self)
     }
@@ -70,6 +73,7 @@ impl SendStream {
     ///
     /// `end` controls whether this is the last body chunk to send. It's an error
     /// to send more data after `end` is `true`.
+    #[instrument(skip(self, cx, data, end))]
     fn poll_send_data(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -101,6 +105,7 @@ impl SendStream {
         Ok(()).into()
     }
 
+    #[instrument(skip(self, cx))]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
@@ -119,7 +124,7 @@ impl SendStream {
         Ok(()).into()
     }
 
-    /// Send one chunk of data. Use `end` to signal end of data.
+    /// Send one chunk of data. Use `end_of_body` to signal end of data.
     ///
     /// Alternate calls to this with calls to `ready` for flow control.
     ///
@@ -128,9 +133,11 @@ impl SendStream {
     /// function will error with a `Error::User`.
     ///
     /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
-    pub async fn send_data(&mut self, data: &[u8], end: bool) -> Result<(), Error> {
+    #[instrument(skip(self, data, end_of_body))]
+    pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
+        trace!("Send len={} end_of_body={}", data.len(), end_of_body);
         poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await?;
         Ok(())
     }
@@ -169,6 +176,7 @@ impl RecvStream {
 
     #[doc(hidden)]
     /// Poll for some body data.
+    #[instrument(skip(self, cx, buf))]
     pub fn poll_body_data(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -226,6 +234,7 @@ impl RecvStream {
     /// Read some body data into a given buffer.
     ///
     /// Ends when returned size is `0`.
+    #[instrument(skip(self, buf))]
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
     }
