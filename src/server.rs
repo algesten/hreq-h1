@@ -117,7 +117,7 @@ where
 
         let mut lock = this.0.lock().unwrap();
 
-        lock.poll_drive(cx, true, inner)
+        lock.poll_drive(cx, true, inner, true)
     }
 
     /// Accept a new incoming request to handle. One must accept new requests continuously
@@ -139,7 +139,7 @@ where
         let mut codec = self.0.lock().unwrap();
 
         // It doesn't matter what the return value is, we just need it to not be pending.
-        ready!(codec.poll_drive(cx, true, inner.clone()));
+        ready!(codec.poll_drive(cx, true, inner.clone(), false));
 
         ().into()
     }
@@ -163,11 +163,14 @@ impl SendResponse {
     /// there will be no body to send.
     ///
     /// It's an error to send a body when the status or headers indicate there should not be one.
+    #[instrument(skip(self, response, no_body))]
     pub fn send_response(
         self,
         response: http::Response<()>,
         no_body: bool,
     ) -> Result<SendStream, Error> {
+        trace!("Send response: {:?}", response);
+
         // bounded to get back pressure
         let (tx_body, rx_body) = mpsc::channel(2);
 
@@ -262,12 +265,13 @@ impl Codec {
         }
     }
 
-    #[instrument(skip(self, cx, want_next_req, inner))]
+    #[instrument(skip(self, cx, want_next_req, inner, pending_on_waiting))]
     pub(crate) fn poll_drive(
         &mut self,
         cx: &mut Context<'_>,
         want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
+        pending_on_waiting: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         loop {
             // try write any bytes ready to be sent.
@@ -288,8 +292,16 @@ impl Codec {
                     continue;
                 }
 
-                DriveResult::Close | DriveResult::Waiting => {
+                DriveResult::Close => {
                     return Poll::Ready(None);
+                }
+
+                DriveResult::Waiting => {
+                    if pending_on_waiting {
+                        return Poll::Pending;
+                    } else {
+                        return Poll::Ready(None);
+                    }
                 }
             }
         }
@@ -624,7 +636,7 @@ impl ServerDrive for Arc<Mutex<Codec>> {
         // this shouldn't really have any contention.
         let mut lock = self.lock().unwrap();
 
-        match lock.poll_drive(cx, false, inner) {
+        match lock.poll_drive(cx, false, inner, false) {
             Poll::Pending => {
                 // this is ok, we have made max progress.const
                 Ok(())
