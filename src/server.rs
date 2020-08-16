@@ -163,7 +163,7 @@ impl SendResponse {
         trace!("Send response: {:?}", response);
 
         // bounded to get back pressure
-        let (tx_body, rx_body) = Receiver::new(2);
+        let (tx_body, rx_body) = Receiver::new(1);
 
         let limit = LimitWrite::from_headers(response.headers());
 
@@ -363,7 +363,7 @@ impl Codec {
                 let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
 
                 // bound channel to get backpressure
-                let (tx_body, rx_body) = Receiver::new(2);
+                let (tx_body, rx_body) = Receiver::new(1);
 
                 let (tx_res, rx_res) = Receiver::new(1);
 

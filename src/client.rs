@@ -146,7 +146,7 @@ impl SendRequest {
         let (res_tx, res_rx) = Receiver::new(1);
 
         // bounded so we provide backpressure if socket is full.
-        let (tx_body, rx_body) = Receiver::new(2);
+        let (tx_body, rx_body) = Receiver::new(1);
 
         let limit = LimitWrite::from_headers(req.headers());
 
@@ -492,7 +492,7 @@ where
                     // TODO: handle CONNECT with a special state where connection becomes a tunnel
 
                     // bounded to have backpressure if client is reading slowly.
-                    let (tx_body, rx_body) = Receiver::new(2);
+                    let (tx_body, rx_body) = Receiver::new(1);
 
                     // holder indicates whether we expect a body.
                     b.holder = if is_no_body {
