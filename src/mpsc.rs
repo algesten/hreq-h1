@@ -12,7 +12,7 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut lock = self.inner.lock().unwrap();
 
-        lock.wake_send();
+        lock.wake_all();
     }
 }
 
@@ -90,7 +90,7 @@ impl<T> Drop for Sender<T> {
             if c == 1 {
                 // no more senders to wake receiver
                 let mut lock = inner.lock().unwrap();
-                lock.wake_recv()
+                lock.wake_all()
             }
         }
     }
@@ -100,8 +100,10 @@ impl<T> Drop for Sender<T> {
 struct Inner<T> {
     queue: VecDeque<T>,
     bound: usize,
-    recv_wait: Option<Waker>,
-    send_wait: VecDeque<Waker>,
+    // We could have separate send and receive wakers. I feel like
+    // that creates potential race conditions. In 99.9% of cases
+    // there will only be one receiver and one sender anyway.
+    wakers: Vec<Waker>,
 }
 
 impl<T> Inner<T> {
@@ -109,14 +111,13 @@ impl<T> Inner<T> {
         Inner {
             queue: VecDeque::new(),
             bound,
-            recv_wait: None,
-            send_wait: VecDeque::new(),
+            wakers: Vec::new(),
         }
     }
 
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<bool> {
         if self.queue.len() >= self.bound {
-            self.send_wait.push_back(cx.waker().clone());
+            self.wakers.push(cx.waker().clone());
             Poll::Pending
         } else {
             true.into()
@@ -125,27 +126,21 @@ impl<T> Inner<T> {
 
     fn enqueue(&mut self, t: T) {
         self.queue.push_back(t);
-        self.wake_recv();
+        self.wake_all();
     }
 
     fn poll_dequeue(&mut self, cx: &mut Context) -> Poll<Option<T>> {
         if let Some(t) = self.queue.pop_front() {
-            self.wake_send();
+            self.wake_all();
             Some(t).into()
         } else {
-            self.recv_wait = Some(cx.waker().clone());
+            self.wakers.push(cx.waker().clone());
             Poll::Pending
         }
     }
 
-    fn wake_recv(&mut self) {
-        if let Some(w) = self.recv_wait.take() {
-            w.wake();
-        }
-    }
-
-    fn wake_send(&mut self) {
-        for w in self.send_wait.drain(..) {
+    fn wake_all(&mut self) {
+        for w in self.wakers.drain(..) {
             w.wake();
         }
     }
