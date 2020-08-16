@@ -55,7 +55,13 @@ impl SendStream {
     ) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
+        if this.ended && end && data.is_empty() {
+            // this is a noop
+            return Ok(()).into();
+        }
+
         if this.ended {
+            warn!("Body data is not expected");
             return Err(Error::User("Body data is not expected".into())).into();
         }
 
