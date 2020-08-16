@@ -110,7 +110,6 @@ pub async fn send_body_chunks(
 
     while i < body.len() {
         let max = (body.len() - i).min(size);
-        body_send = body_send.ready().await?;
         body_send.send_data(&body[i..(i + max)], false).await?;
         i += max;
     }

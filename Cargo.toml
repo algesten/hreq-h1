@@ -11,7 +11,6 @@ readme = "README.md"
 edition = "2018"
 
 [dependencies]
-futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
 futures-io = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "io", "sink"] }
 http = "0.2"
@@ -22,3 +21,4 @@ tracing-futures = "0.2"
 [dev-dependencies]
 async-std = { version = "1", features = ["attributes"] }
 tracing-subscriber = "0.2"
+tracing-flame = "0.1.0"

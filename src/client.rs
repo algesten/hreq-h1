@@ -31,12 +31,8 @@
 //!   let req = Request::post("http://myspecial.server/recv")
 //!     .body(())?;
 //!
-//!   let (res, send_body) = h1.send_request(req, false)?;
+//!   let (res, mut send_body) = h1.send_request(req, false)?;
 //!
-//!   // Before we send body, make sure it's ready to be received.
-//!   // If we have a big body, this is done in a loop to get
-//!   // flow control.
-//!   let mut send_body = send_body.ready().await?;
 //!   send_body.send_data(b"This is the request body data", true).await?;
 //!
 //!   let (head, mut body) = res.await?.into_parts();
@@ -67,14 +63,12 @@ use crate::err_closed;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
+use crate::mpsc::{Receiver, Sender};
 use crate::try_write::try_write;
 use crate::Error;
 use crate::{AsyncRead, AsyncWrite};
 use crate::{RecvStream, SendStream};
-use futures_channel::{mpsc, oneshot};
 use futures_util::ready;
-use futures_util::sink::Sink;
-use futures_util::stream::Stream;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -95,7 +89,7 @@ pub fn handshake<S>(io: S) -> (SendRequest, Connection<S>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (req_tx, req_rx) = mpsc::channel(100);
+    let (req_tx, req_rx) = Receiver::new(100);
 
     let send_req = SendRequest::new(req_tx);
 
@@ -109,7 +103,7 @@ where
 /// See [module level doc](index.html) for an example.
 #[derive(Clone)]
 pub struct SendRequest {
-    req_tx: mpsc::Sender<Handle>,
+    req_tx: Sender<Handle>,
 }
 
 /// Holder of all details for a new request.
@@ -118,12 +112,12 @@ pub struct SendRequest {
 struct Handle {
     req: http::Request<()>,
     no_send_body: bool,
-    rx_body: mpsc::Receiver<(Vec<u8>, bool)>,
-    res_tx: Option<oneshot::Sender<io::Result<http::Response<RecvStream>>>>,
+    rx_body: Receiver<(Vec<u8>, bool)>,
+    res_tx: Option<Sender<io::Result<http::Response<RecvStream>>>>,
 }
 
 impl SendRequest {
-    fn new(req_tx: mpsc::Sender<Handle>) -> Self {
+    fn new(req_tx: Sender<Handle>) -> Self {
         SendRequest { req_tx }
     }
 
@@ -149,10 +143,10 @@ impl SendRequest {
         trace!("Send request: {:?}", req);
 
         // Channel to send response back.
-        let (res_tx, res_rx) = oneshot::channel();
+        let (res_tx, res_rx) = Receiver::new(1);
 
         // bounded so we provide backpressure if socket is full.
-        let (tx_body, rx_body) = mpsc::channel(2);
+        let (tx_body, rx_body) = Receiver::new(2);
 
         let limit = LimitWrite::from_headers(req.headers());
 
@@ -166,7 +160,7 @@ impl SendRequest {
             res_tx: Some(res_tx),
         };
 
-        if self.req_tx.try_send(next).is_err() {
+        if !self.req_tx.send(next) {
             // errors on full or closed, and since it's unbound...
             return err_closed();
         }
@@ -179,7 +173,7 @@ impl SendRequest {
 }
 
 /// Future for a `http::Response<RecvStream>>`
-pub struct ResponseFuture(oneshot::Receiver<io::Result<http::Response<RecvStream>>>);
+pub struct ResponseFuture(Receiver<io::Result<http::Response<RecvStream>>>);
 
 impl Future for ResponseFuture {
     type Output = Result<http::Response<RecvStream>, Error>;
@@ -187,9 +181,9 @@ impl Future for ResponseFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        let res = ready!(Pin::new(&mut this.0).poll(cx));
+        let res = ready!(Pin::new(&mut this.0).poll_recv(cx));
 
-        if let Ok(v) = res {
+        if let Some(v) = res {
             // nested io::Error
             let v = v?;
 
@@ -219,7 +213,7 @@ where
 
 struct Codec<S> {
     io: BufReader<S>,
-    req_rx: mpsc::Receiver<Handle>,
+    req_rx: Receiver<Handle>,
     to_write: Vec<u8>,
     to_write_flush_after: bool,
     state: State,
@@ -262,22 +256,22 @@ impl State {
         match self {
             State::SendReq(mut h) => {
                 if let Some(res_tx) = h.res_tx.take() {
-                    res_tx.send(Err(error)).ok();
+                    res_tx.send(Err(error));
                 }
             }
             State::RecvRes(mut b) => {
                 if let Some(res_tx) = b.handle.res_tx.take() {
-                    res_tx.send(Err(error)).ok();
-                } else if let Some((mut tx_body, _)) = b.holder.take() {
-                    if let Err(_) = tx_body.try_send(Err(error)) {
+                    res_tx.send(Err(error));
+                } else if let Some((tx_body, _)) = b.holder.take() {
+                    if !tx_body.send(Err(error)) {
                         // best effort, and it failed, not much to do. the
                         // error still surfaces in the Connection
                         debug!("Failed to notify RecvStream about error");
                     }
                 }
             }
-            State::RecvBody(mut r) => {
-                if let Err(_) = r.tx_body.try_send(Err(error)) {
+            State::RecvBody(r) => {
+                if !r.tx_body.send(Err(error)) {
                     // best effort, and it failed, not much to do. the
                     // error still surfaces in the Connection
                     debug!("Failed to notify RecvStream about error");
@@ -299,15 +293,14 @@ struct Bidirect {
     allow_reuse: bool,
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
-    holder: Option<(mpsc::Sender<io::Result<Vec<u8>>>, LimitRead)>,
+    holder: Option<(Sender<io::Result<Vec<u8>>>, LimitRead)>,
 }
 
 /// Receiver of response body.
 struct BodyReceiver {
     handle: Handle,
     limit: LimitRead,
-    tx_body: mpsc::Sender<io::Result<Vec<u8>>>,
-    tx_body_needs_flush: bool,
+    tx_body: Sender<io::Result<Vec<u8>>>,
     recv_buf: Vec<u8>,
     allow_reuse: bool,
 }
@@ -316,7 +309,7 @@ impl<S> Codec<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(io: S, req_rx: mpsc::Receiver<Handle>) -> Self {
+    fn new(io: S, req_rx: Receiver<Handle>) -> Self {
         Codec {
             io: BufReader::with_capacity(READ_BUF_INIT_SIZE, io),
             req_rx,
@@ -376,7 +369,7 @@ where
 
             State::Waiting => {
                 // try get the next request.
-                let next = ready!(Pin::new(&mut self.req_rx).poll_next(cx));
+                let next = ready!(Pin::new(&mut self.req_rx).poll_recv(cx));
 
                 if let Some(h) = next {
                     trace!("Waiting => SendReq");
@@ -428,7 +421,7 @@ where
 
                 if !b.done_req_body {
                     // Not done sending a request body. Try get a body chunk to send.
-                    match Pin::new(&mut b.handle.rx_body).poll_next(cx) {
+                    match Pin::new(&mut b.handle.rx_body).poll_recv(cx) {
                         Poll::Pending => {
                             // Pending is ok, it means the SendBody has not sent any chunk.
                             trace!("Read req_body: Pending");
@@ -499,7 +492,7 @@ where
                     // TODO: handle CONNECT with a special state where connection becomes a tunnel
 
                     // bounded to have backpressure if client is reading slowly.
-                    let (tx_body, rx_body) = mpsc::channel(2);
+                    let (tx_body, rx_body) = Receiver::new(2);
 
                     // holder indicates whether we expect a body.
                     b.holder = if is_no_body {
@@ -516,7 +509,7 @@ where
                     // invariant: the oneshot handle should only exist once.
                     let res_tx = b.handle.res_tx.take().expect("Missing res_tx");
 
-                    if let Err(_) = res_tx.send(Ok(res)) {
+                    if !res_tx.send(Ok(res)) {
                         // res_tx is unbounded, the only error possible is that the
                         // response future is dropped and client is not interested in response.
                         // This is not an error, we continue to drive the connection.
@@ -544,7 +537,6 @@ where
                         self.state = State::RecvBody(BodyReceiver {
                             handle,
                             tx_body,
-                            tx_body_needs_flush: false,
                             limit,
                             recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
                             allow_reuse,
@@ -573,33 +565,17 @@ where
             }
 
             State::RecvBody(r) => {
-                // if the tx_body needs flushing, deal with that first
-                if r.tx_body_needs_flush {
-                    trace!("tx_body needs flush");
-                    // if the flushing fails, the receiver is gone, that's ok.
-                    ready!(Pin::new(&mut r.tx_body).poll_flush(cx)).ok();
-
-                    r.tx_body_needs_flush = false;
-                }
-
                 if !r.recv_buf.is_empty() {
                     trace!("tx_body try send chunk");
-                    // we got a chunk read to send off to the RecvStream
-                    if let Err(_) = ready!(r.tx_body.poll_ready(cx)) {
-                        // Receiver is gone. We continue receving to get
-                        // connection in a good state for next request.
-                    }
 
                     let chunk =
                         mem::replace(&mut r.recv_buf, Vec::with_capacity(READ_BUF_INIT_SIZE));
 
                     // Since we poll_ready above, the error here is that the receiver is gone,
                     // which isn't a problem.
-                    let needs_flush = r.tx_body.start_send(Ok(chunk)).is_ok();
+                    r.tx_body.send(Ok(chunk));
 
                     trace!("tx_body chunk sent");
-                    // As per the Sink contract, flush after start_send()
-                    r.tx_body_needs_flush = needs_flush;
 
                     // loop
                     return Ok(true).into();

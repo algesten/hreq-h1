@@ -1,13 +1,11 @@
 use crate::limit::LimitWrite;
+use crate::mpsc::{Receiver, Sender};
 use crate::server::Codec;
 use crate::server::ServerDrive;
 use crate::AsyncRead;
 use crate::Error;
-use futures_channel::mpsc;
 use futures_util::future::poll_fn;
 use futures_util::ready;
-use futures_util::sink::Sink;
-use futures_util::stream::Stream;
 use std::fmt;
 use std::io;
 use std::pin::Pin;
@@ -21,7 +19,7 @@ use std::task::{Context, Poll};
 /// [`client::SendRequest`]: client/struct.SendRequest.html
 /// [`server::SendResponse`]: server/struct.SendResponse.html
 pub struct SendStream {
-    tx_body: mpsc::Sender<(Vec<u8>, bool)>,
+    tx_body: Sender<(Vec<u8>, bool)>,
     limit: LimitWrite,
     ended: bool,
     // used in RecvStream originating in server to drive the connection
@@ -31,7 +29,7 @@ pub struct SendStream {
 
 impl SendStream {
     pub(crate) fn new(
-        tx_body: mpsc::Sender<(Vec<u8>, bool)>,
+        tx_body: Sender<(Vec<u8>, bool)>,
         limit: LimitWrite,
         ended: bool,
         server_inner: Option<Arc<Mutex<Codec>>>,
@@ -42,31 +40,6 @@ impl SendStream {
             ended,
             server_inner,
         }
-    }
-
-    /// Poll for whether this connection is ready to send more data without blocking.
-    #[instrument(skip(self, cx))]
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
-        let this = self.get_mut();
-
-        if let Some(server_inner) = &this.server_inner {
-            server_inner.poll_drive_external(cx)?;
-        }
-
-        ready!(Pin::new(&mut this.tx_body).poll_ready(cx))
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
-
-        Ok(()).into()
-    }
-
-    /// Test whether connection is ready to send more data. The call stalls until
-    /// any previous data provided in `send_data()` has been transfered to the remote
-    /// peer (or at least in a buffer). As such, this can form part of flow control.
-    #[instrument(skip(self))]
-    pub async fn ready(mut self) -> Result<SendStream, Error> {
-        trace!("Wait until ready for next send_data");
-        poll_fn(|cx| Pin::new(&mut self).poll_ready(cx)).await?;
-        Ok(self)
     }
 
     /// Send some body data.
@@ -90,6 +63,13 @@ impl SendStream {
             server_inner.poll_drive_external(cx)?;
         }
 
+        if !ready!(Pin::new(&this.tx_body).poll_ready(cx)) {
+            return Err(
+                io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed").into(),
+            )
+            .into();
+        }
+
         let mut chunk = Vec::with_capacity(data.len() + this.limit.overhead());
         this.limit.write(data, &mut chunk)?;
 
@@ -98,24 +78,20 @@ impl SendStream {
             this.limit.finish(&mut chunk)?;
         }
 
-        this.tx_body
-            .start_send((chunk, end))
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
+        let sent = this.tx_body.send((chunk, end));
+
+        if !sent {
+            return Err(
+                io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed").into(),
+            )
+            .into();
+        }
 
         Ok(()).into()
     }
 
-    #[instrument(skip(self, cx))]
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_drive(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
-
-        if let Some(server_inner) = &this.server_inner {
-            server_inner.poll_drive_external(cx)?;
-        }
-
-        ready!(Pin::new(&mut this.tx_body)
-            .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e)))?;
 
         if let Some(server_inner) = &this.server_inner {
             server_inner.poll_drive_external(cx)?;
@@ -136,9 +112,8 @@ impl SendStream {
     #[instrument(skip(self, data, end_of_body))]
     pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
-        poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_drive(cx)).await?;
         Ok(())
     }
 }
@@ -150,7 +125,7 @@ impl SendStream {
 /// [`client::ResponseFuture`]: client/struct.ResponseFuture.html
 /// [`server::Connection`]: server/struct.Connection.html
 pub struct RecvStream {
-    rx_body: mpsc::Receiver<io::Result<Vec<u8>>>,
+    rx_body: Receiver<io::Result<Vec<u8>>>,
     ready: Option<Vec<u8>>,
     index: usize,
     // used in RecvStream originating in server to drive the connection
@@ -161,7 +136,7 @@ pub struct RecvStream {
 
 impl RecvStream {
     pub(crate) fn new(
-        rx_body: mpsc::Receiver<io::Result<Vec<u8>>>,
+        rx_body: Receiver<io::Result<Vec<u8>>>,
         server_inner: Option<Arc<Mutex<Codec>>>,
         ended: bool,
     ) -> Self {
@@ -214,7 +189,7 @@ impl RecvStream {
             // invariant: Should be no ready bytes if we're here.
             assert!(this.ready.is_none());
 
-            match ready!(Pin::new(&mut this.rx_body).poll_next(cx)) {
+            match ready!(Pin::new(&mut this.rx_body).poll_recv(cx)) {
                 None => {
                     // Channel is closed which indicates end of body.
                     this.ended = true;

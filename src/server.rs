@@ -36,14 +36,9 @@
 //!                         .unwrap();
 //!
 //!                     // Send the response back to the client
-//!                     let send_body = respond
+//!                     let mut send_body = respond
 //!                         .send_response(response, false).unwrap();
 //!
-//!                     // For big bodies, we would alternate we get flow
-//!                     // control by alternating between ready/send_data
-//!                     // in a loop.
-//!                     let mut send_body = send_body.ready()
-//!                         .await.unwrap();
 //!                     send_body.send_data(b"Hello world!", true)
 //!                         .await.unwrap();
 //!                 }
@@ -61,19 +56,16 @@ use crate::buf_reader::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
+use crate::mpsc::{Receiver, Sender};
 use crate::try_write::try_write;
 use crate::Error;
 use crate::RecvStream;
 use crate::SendStream;
 use crate::{AsyncRead, AsyncWrite};
-use futures_channel::{mpsc, oneshot};
 use futures_io::AsyncBufRead;
 use futures_util::future::poll_fn;
 use futures_util::ready;
-use futures_util::sink::Sink;
-use futures_util::stream::Stream;
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -149,7 +141,7 @@ where
 /// See [module level doc](index.html) for an example.
 pub struct SendResponse {
     inner: Arc<Mutex<Codec>>,
-    tx_res: oneshot::Sender<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,
+    tx_res: Sender<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
 }
 
 impl SendResponse {
@@ -171,7 +163,7 @@ impl SendResponse {
         trace!("Send response: {:?}", response);
 
         // bounded to get back pressure
-        let (tx_body, rx_body) = mpsc::channel(2);
+        let (tx_body, rx_body) = Receiver::new(2);
 
         let limit = LimitWrite::from_headers(response.headers());
 
@@ -190,9 +182,9 @@ impl SendResponse {
 
         let send = SendStream::new(tx_body, limit, ended, Some(self.inner));
 
-        self.tx_res
-            .send((response, ended, rx_body))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Connection closed"))?;
+        if !self.tx_res.send((response, ended, rx_body)) {
+            Err(io::Error::new(io::ErrorKind::Other, "Connection closed"))?;
+        }
 
         Ok(send)
     }
@@ -224,19 +216,18 @@ enum State {
 /// State where can both send a response and receive a request body, if appropriate.
 struct Bidirect {
     limit: LimitRead,
-    tx_body: Option<mpsc::Sender<io::Result<Vec<u8>>>>,
-    tx_body_needs_flush: bool,
-    rx_res: oneshot::Receiver<(http::Response<()>, bool, mpsc::Receiver<(Vec<u8>, bool)>)>,
+    tx_body: Option<Sender<io::Result<Vec<u8>>>>,
+    rx_res: Receiver<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
     done_req_body: bool,
     done_response: bool,
     /// Placeholder used if we received a response but are not finished
     /// sending the request body.
-    holder: Option<(bool, LimitWrite, Option<mpsc::Receiver<(Vec<u8>, bool)>>)>,
+    holder: Option<(bool, LimitWrite, Option<Receiver<(Vec<u8>, bool)>>)>,
     reusable: bool,
 }
 
 struct BodySender {
-    rx_body: mpsc::Receiver<(Vec<u8>, bool)>,
+    rx_body: Receiver<(Vec<u8>, bool)>,
     ended: bool,
     reusable: bool,
 }
@@ -316,10 +307,15 @@ impl Codec {
 
         match &mut self.state {
             State::Closed => {
+                let span = trace_span!("Closed");
+                let _enter = span.enter();
                 return Poll::Ready(Ok(DriveResult::Close));
             }
 
             State::Waiting => {
+                let span = trace_span!("Waiting");
+                let _enter = span.enter();
+
                 if !want_next_req {
                     return Poll::Ready(Ok(DriveResult::Waiting));
                 }
@@ -350,6 +346,9 @@ impl Codec {
             }
 
             State::RecvReq(req) => {
+                let span = trace_span!("RecvReq");
+                let _enter = span.enter();
+
                 let req = req.take().expect("No request for RecvReq");
 
                 // Limiter to read the correct body amount from the socket.
@@ -364,9 +363,9 @@ impl Codec {
                 let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
 
                 // bound channel to get backpressure
-                let (tx_body, rx_body) = mpsc::channel(2);
+                let (tx_body, rx_body) = Receiver::new(2);
 
-                let (tx_res, rx_res) = oneshot::channel();
+                let (tx_res, rx_res) = Receiver::new(1);
 
                 // Prepare the new "package" to be delivered out of the poll loop.
                 let package = {
@@ -386,7 +385,6 @@ impl Codec {
                 self.state = State::SendRes(Bidirect {
                     limit,
                     tx_body: Some(tx_body),
-                    tx_body_needs_flush: false,
                     rx_res,
                     done_req_body,
                     done_response: false,
@@ -403,41 +401,23 @@ impl Codec {
                 // to send a response at the same time as attempting to receive
                 // a request body (if headers indicate it).
 
-                // if the tx_body needs flushing, deal with that first
-                if h.tx_body_needs_flush {
-                    trace!("tx_body needs flush");
-                    if let Some(tx_body) = h.tx_body.as_mut() {
-                        let span = trace_span!("tx_body.poll_flush");
-                        let _enter = span.enter();
-                        // The RecvStream might be dropped, that's ok.
-                        ready!(Pin::new(tx_body).poll_flush(cx)).ok();
-                    }
-                    h.tx_body_needs_flush = false;
-                }
+                let span = trace_span!("SendRes");
+                let _enter = span.enter();
 
                 let mut req_body_pending = false;
 
                 if !h.done_req_body {
                     if !self.read_buf.is_empty() {
                         if let Some(tx_body) = h.tx_body.as_mut() {
-                            let span = trace_span!("tx_body.poll_ready");
-                            let _enter = span.enter();
                             trace!("tx_body try send chunk");
-                            if let Err(_) = ready!(tx_body.poll_ready(cx)) {
-                                // The RecvStream is dropped, that's ok, we continue
-                                // to drive the connection. Specifically we need
-                                // to still exhaust the entire body to ensure
-                                // the socket can be reused for a new request.
+                            if !ready!(Pin::new(&*tx_body).poll_ready(cx)) {
+                                // receiver of body chunks is dropped, that's ok.
                             }
-                            drop(_enter);
 
                             let chunk = self.read_buf.take_vec();
 
                             // The RecvStream might be dropped, that's ok.
-                            let needs_flush = tx_body.start_send(Ok(chunk)).is_ok();
-
-                            // As per Sink contract, flush after send.
-                            h.tx_body_needs_flush = needs_flush;
+                            tx_body.send(Ok(chunk));
 
                             trace!("tx_body chunk sent");
                             // loop to send off what was used received.
@@ -446,15 +426,12 @@ impl Codec {
                             // tx_body is gone, empty buffer
                             trace!("tx_body not present, drop chunk");
                             self.read_buf.empty();
-                            h.tx_body_needs_flush = false;
                         }
                     }
 
                     // When ref drops, buffer is resized.
                     let mut read_into = self.read_buf.borrow();
 
-                    let span = trace_span!("limit.poll_read");
-                    let _enter = span.enter();
                     match h.limit.poll_read(cx, &mut self.io, &mut read_into) {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
@@ -485,11 +462,9 @@ impl Codec {
                 }
 
                 if !h.done_response {
-                    let span = trace_span!("rx_res.poll");
-                    let _enter = span.enter();
-                    let (res, end, rx_body) = match ready!(Pin::new(&mut h.rx_res).poll(cx)) {
-                        Ok((res, end, rx_body)) => (res, end, Some(rx_body)),
-                        Err(_) => {
+                    let (res, end, rx_body) = match ready!(Pin::new(&mut h.rx_res).poll_recv(cx)) {
+                        Some((res, end, rx_body)) => (res, end, Some(rx_body)),
+                        None => {
                             // SendResponse was dropped before any response was sent.
                             // That's a fault, but we can save the connection! :)
                             warn!("SendResponse dropped without sending a response");
@@ -500,7 +475,6 @@ impl Codec {
                             )
                         }
                     };
-                    drop(_enter);
 
                     // got a response now.
                     trace!("done_response: true");
@@ -569,6 +543,9 @@ impl Codec {
             }
 
             State::SendBody(b) => {
+                let span = trace_span!("SendBody");
+                let _enter = span.enter();
+
                 // If there is a chunk to write, we will wait until it's written.
                 // Doing Poll::Pending here is deliberate. Before drive_state() we have
                 // made as much progress in try_write as possible.
@@ -587,10 +564,7 @@ impl Codec {
                     return Ok(DriveResult::Loop).into();
                 }
 
-                let span = trace_span!("rx_body.poll");
-                let _enter = span.enter();
-                let next = ready!(Pin::new(&mut b.rx_body).poll_next(cx));
-                drop(_enter);
+                let next = ready!(Pin::new(&mut b.rx_body).poll_recv(cx));
 
                 if let Some((mut chunk, end)) = next {
                     if end {

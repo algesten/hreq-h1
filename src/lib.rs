@@ -57,6 +57,7 @@ extern crate tracing;
 
 mod error;
 mod limit;
+mod mpsc;
 mod share;
 mod try_write;
 
