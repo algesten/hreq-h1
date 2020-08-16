@@ -52,7 +52,7 @@
 //!
 
 use crate::buf_reader::BufReader;
-use crate::buf_reader::FastBuf;
+use crate::fast_buf::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
@@ -429,6 +429,9 @@ impl Codec {
                         }
                     }
 
+                    // invariant: we don't append to buffer, it must be sent to tx_body now.
+                    assert!(self.read_buf.is_empty());
+
                     // When ref drops, buffer is resized.
                     let mut read_into = self.read_buf.borrow();
 
@@ -567,6 +570,8 @@ impl Codec {
                 let next = ready!(Pin::new(&mut b.rx_body).poll_recv(cx));
 
                 if let Some((mut chunk, end)) = next {
+                    trace!("Body data to send len={}, end={}", chunk.len(), end);
+
                     if end {
                         b.ended = true;
                     }
@@ -587,7 +592,6 @@ impl Codec {
                             trace!("SendBody => Closed (not reusable)");
                             State::Closed
                         };
-                        return Ok(DriveResult::Loop).into();
                     }
 
                     return Ok(DriveResult::Loop).into();

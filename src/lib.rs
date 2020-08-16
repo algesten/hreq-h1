@@ -56,6 +56,7 @@
 extern crate tracing;
 
 mod error;
+mod fast_buf;
 mod limit;
 mod mpsc;
 mod share;
