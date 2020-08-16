@@ -60,7 +60,6 @@ mod fast_buf;
 mod limit;
 mod mpsc;
 mod share;
-mod try_write;
 
 #[doc(hidden)]
 pub mod buf_reader;
@@ -71,7 +70,7 @@ pub mod http11;
 #[doc(hidden)]
 pub mod chunked;
 
-pub(crate) use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
+pub(crate) use futures_io::{AsyncRead, AsyncWrite};
 
 pub mod client;
 pub mod server;

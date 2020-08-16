@@ -49,13 +49,8 @@ impl FastBuf {
         self.0.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn take_vec(&mut self) -> Vec<u8> {
-        let cap = self.0.capacity();
-        std::mem::replace(&mut self.0, Vec::with_capacity(cap))
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
     }
 
     pub fn borrow<'a>(&'a mut self) -> FastBufRef<'a> {

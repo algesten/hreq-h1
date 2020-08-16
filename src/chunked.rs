@@ -1,5 +1,6 @@
 use super::AsyncRead;
 use super::Error;
+use crate::buf_reader::BufIo;
 use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::io;
@@ -37,19 +38,19 @@ impl ChunkedDecoder {
         self.state == DecoderState::End
     }
 
-    pub async fn read<R: AsyncRead + Unpin>(
+    pub async fn read<S: AsyncRead + Unpin>(
         &mut self,
-        recv: &mut R,
+        recv: &mut BufIo<S>,
         buf: &mut [u8],
     ) -> io::Result<usize> {
         Ok(poll_fn(|cx| self.poll_read(cx, recv, buf)).await?)
     }
 
     #[instrument(skip(self, cx, recv, buf))]
-    pub fn poll_read<R: AsyncRead + Unpin>(
+    pub fn poll_read<S: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<S>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         assert!(!buf.is_empty(), "Chunk read with empty buf");
@@ -101,10 +102,10 @@ impl ChunkedDecoder {
     }
 
     // 3\r\nhel\r\nb\r\nlo world!!!\r\n0\r\n\r\n
-    fn poll_chunk_size<R: AsyncRead + Unpin>(
+    fn poll_chunk_size<S: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<S>,
     ) -> Poll<io::Result<()>> {
         // read until we get a non-numeric character. this could be
         // either \r or maybe a ; if we are using "extensions"
@@ -165,10 +166,10 @@ impl ChunkedDecoder {
     }
 
     // skip until we get a \n
-    fn poll_skip_until_lf<R: AsyncRead + Unpin>(
+    fn poll_skip_until_lf<S: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<S>,
     ) -> Poll<io::Result<()>> {
         // skip until we get a \n
         let mut one = [0_u8; 1];

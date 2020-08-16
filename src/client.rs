@@ -65,7 +65,6 @@ use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::mpsc::{Receiver, Sender};
-use crate::try_write::try_write;
 use crate::Error;
 use crate::{AsyncRead, AsyncWrite};
 use crate::{RecvStream, SendStream};
@@ -73,7 +72,6 @@ use futures_util::ready;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -107,16 +105,6 @@ pub struct SendRequest {
     req_tx: Sender<Handle>,
 }
 
-/// Holder of all details for a new request.
-///
-/// This internally communicates with the `Connection`.
-struct Handle {
-    req: http::Request<()>,
-    no_send_body: bool,
-    rx_body: Receiver<(Vec<u8>, bool)>,
-    res_tx: Option<Sender<io::Result<http::Response<RecvStream>>>>,
-}
-
 impl SendRequest {
     fn new(req_tx: Sender<Handle>) -> Self {
         SendRequest { req_tx }
@@ -147,17 +135,19 @@ impl SendRequest {
         let (res_tx, res_rx) = Receiver::new(1);
 
         // bounded so we provide backpressure if socket is full.
-        let (tx_body, rx_body) = Receiver::new(1);
+        let (body_tx, body_rx) = Receiver::new(1);
 
         let limit = LimitWrite::from_headers(req.headers());
 
         let no_send_body = no_body || limit.is_no_body();
 
+        // Don't provide an body_rx if headers or no_body flag indicates there is no body.
+        let body_rx = if no_send_body { None } else { Some(body_rx) };
+
         // The handle for the codec/connection.
         let next = Handle {
             req,
-            no_send_body,
-            rx_body,
+            body_rx,
             res_tx: Some(res_tx),
         };
 
@@ -167,10 +157,19 @@ impl SendRequest {
         }
 
         let fut = ResponseFuture(res_rx);
-        let send = SendStream::new(tx_body, limit, no_send_body, None);
+        let send = SendStream::new(body_tx, limit, no_send_body, None);
 
         Ok((fut, send))
     }
+}
+
+/// Holder of all details for a new request.
+///
+/// This internally communicates with the `Connection`.
+struct Handle {
+    req: http::Request<()>,
+    body_rx: Option<Receiver<(Vec<u8>, bool)>>,
+    res_tx: Option<Sender<io::Result<http::Response<RecvStream>>>>,
 }
 
 /// Future for a `http::Response<RecvStream>>`
@@ -208,102 +207,49 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.0.poll_drive(cx)
+        this.0.poll_client(cx)
     }
 }
 
-struct Codec<S> {
-    io: BufIo<S>,
-    req_rx: Receiver<Handle>,
-    to_write: Vec<u8>,
-    to_write_flush_after: bool,
-    state: State,
-}
-
 enum State {
-    /// Waiting for the next request.
-    Waiting,
-    /// Send request.
-    SendReq(Handle),
+    /// Send next request.
+    SendReq(SendReq),
     /// Receive response and (if appropriate), send request body.
     RecvRes(Bidirect),
     /// Receive response body.
     RecvBody(BodyReceiver),
-    /// Placeholder
-    Empty,
 }
 
 impl State {
-    /// Take the ReqHandle from the state, leave placeholder State::Empty in place.
-    fn take_handle(&mut self) -> Handle {
-        // Replace reference with placeholder.
-        let state = mem::replace(self, State::Empty);
-
-        // Take the handle
-        match state {
-            State::SendReq(h) => h,
-            State::RecvRes(b) => b.handle,
-            State::RecvBody(r) => r.handle,
-            _ => panic!("take_handle in incorrect state"),
-        }
-    }
-
-    /// "bubble" an error to API side.
-    ///
-    /// Depending on state the io error will surface in different places. If
-    /// the client is waiting on a FutureResponse, it can go there, or if
-    /// the client reading a RecvStream (request body), it can go there.
-    fn propagate_error(self, error: io::Error) {
+    fn try_forward_error(&mut self, e: io::Error) -> io::Error {
         match self {
-            State::SendReq(mut h) => {
-                if let Some(res_tx) = h.res_tx.take() {
-                    res_tx.send(Err(error));
+            State::SendReq(_) => e,
+            State::RecvRes(h) => {
+                if let Some(res_tx) = &mut h.handle.res_tx {
+                    let c = clone_error(&e);
+                    res_tx.send(Err(e));
+                    c
+                } else {
+                    e
                 }
             }
-            State::RecvRes(mut b) => {
-                if let Some(res_tx) = b.handle.res_tx.take() {
-                    res_tx.send(Err(error));
-                } else if let Some((tx_body, _)) = b.holder.take() {
-                    if !tx_body.send(Err(error)) {
-                        // best effort, and it failed, not much to do. the
-                        // error still surfaces in the Connection
-                        debug!("Failed to notify RecvStream about error");
-                    }
-                }
+            State::RecvBody(h) => {
+                let c = clone_error(&e);
+                h.body_tx.send(Err(e));
+                c
             }
-            State::RecvBody(r) => {
-                if !r.tx_body.send(Err(error)) {
-                    // best effort, and it failed, not much to do. the
-                    // error still surfaces in the Connection
-                    debug!("Failed to notify RecvStream about error");
-                }
-            }
-            State::Waiting | State::Empty => {}
         }
     }
 }
 
-/// Bidirection state. Receive response as well as send request body (if appropriate).
-struct Bidirect {
-    handle: Handle,
-    /// If we are finished sending request body.
-    done_req_body: bool,
-    /// If we are finished receiving the response.
-    done_response: bool,
-    /// Whether the response version + headers allow connection reuse.
-    allow_reuse: bool,
-    /// Placeholder used if we received a response but are not finished
-    /// sending the request body.
-    holder: Option<(Sender<io::Result<Vec<u8>>>, LimitRead)>,
+fn clone_error(e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), e.to_string())
 }
 
-/// Receiver of response body.
-struct BodyReceiver {
-    handle: Handle,
-    limit: LimitRead,
-    tx_body: Sender<io::Result<Vec<u8>>>,
-    recv_buf: FastBuf,
-    allow_reuse: bool,
+struct Codec<S> {
+    io: BufIo<S>,
+    state: State,
+    req_rx: Receiver<Handle>,
 }
 
 impl<S> Codec<S>
@@ -313,387 +259,403 @@ where
     fn new(io: S, req_rx: Receiver<Handle>) -> Self {
         Codec {
             io: BufIo::with_capacity(READ_BUF_INIT_SIZE, io),
+            state: State::SendReq(SendReq),
             req_rx,
-            to_write: Vec::with_capacity(MAX_REQUEST_SIZE),
-            to_write_flush_after: false,
-            state: State::Waiting,
         }
     }
 
     #[instrument(skip(self, cx))]
-    fn poll_drive(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        loop {
-            // whether we have Poll::Pending on io.
-            let mut pending_io = false;
+    fn poll_client(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+        // Any error bubbling up closes the connection.
+        match self.drive(cx) {
+            Poll::Ready(Err(e)) => {
+                debug!("Close on error: {:?}", e);
 
-            // first try to write queued outgoing bytes until it is pending or empty,
-            match try_write(
-                cx,
-                &mut self.io,
-                &mut self.to_write,
-                &mut self.to_write_flush_after,
-            ) {
-                Poll::Ready(v) => v?,
-                Poll::Pending => {
-                    pending_io = true;
-                }
+                // Attempt to forward the error to the client side. This is only
+                // possible in some states. We either get the original or a cloned
+                // error back to bubble up to the connection.
+                let e = self.state.try_forward_error(e);
+
+                trace!("{:?} => Closed", self.state);
+
+                Err(e).into()
             }
+            r @ _ => r,
+        }
+    }
 
-            // then drive state forward
-            match ready!(self.drive_state(cx, &mut pending_io)) {
-                Ok(do_loop) => {
-                    // drive_state() can signal whether we should continue looping.
-                    // this is not the same asPoll::Pending. ending the loop means
-                    // the connectiong should be gracefully closed.
-                    if !do_loop {
-                        break;
+    fn drive(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+        loop {
+            ready!(Pin::new(&mut self.io).poll_finish_pending_write(cx))?;
+
+            match &mut self.state {
+                State::SendReq(h) => {
+                    let next_state = ready!(h.poll_send_req(cx, &mut self.io, &mut self.req_rx))?;
+
+                    if let Some(next_state) = next_state {
+                        trace!("SendReq => {:?}", next_state);
+                        self.state = next_state;
+                    } else {
+                        // No more requests to send
+                        return Ok(()).into();
                     }
                 }
+                State::RecvRes(h) => {
+                    let next_state = ready!(h.poll_bidirect(cx, &mut self.io))?;
 
-                Err(e) => {
-                    // clone the error to be sent API side.
-                    let clone = io::Error::new(e.kind(), format!("{}", e));
+                    if let Some(next_state) = next_state {
+                        trace!("RecvRes => {:?}", next_state);
+                        self.state = next_state;
+                    } else {
+                        // No more requests to send
+                        return Ok(()).into();
+                    }
+                }
+                State::RecvBody(h) => {
+                    let next_state = ready!(h.poll_read_body(cx, &mut self.io))?;
 
-                    // try propagate the error to the client side.
-                    let state = mem::replace(&mut self.state, State::Empty);
-                    state.propagate_error(clone);
-
-                    // the actual error goes to the connection.
-                    return Err(e).into();
+                    if let Some(next_state) = next_state {
+                        trace!("RecvBody => {:?}", next_state);
+                        self.state = next_state;
+                    } else {
+                        // No more requests to send
+                        return Ok(()).into();
+                    }
                 }
             }
+        }
+    }
+}
+
+struct SendReq;
+
+impl SendReq {
+    #[instrument(skip(self, cx, io, req_rx))]
+    fn poll_send_req<S>(
+        &mut self,
+        cx: &mut Context,
+        io: &mut BufIo<S>,
+        req_rx: &mut Receiver<Handle>,
+    ) -> Poll<io::Result<Option<State>>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let handle = match ready!(Pin::new(req_rx).poll_recv(cx, true)) {
+            Some(v) => v,
+            None => {
+                return Ok(None).into();
+            }
+        };
+
+        let mut buf = FastBuf::with_capacity(MAX_REQUEST_SIZE);
+
+        let mut write_to = buf.borrow();
+
+        let amount = write_http1x_req(&handle.req, &mut write_to)?;
+
+        write_to.add_len(amount);
+
+        // invariant: Can't have any pending bytes to write now.
+        assert!(io.can_poll_write());
+
+        let mut to_send = Some(&buf[..]);
+
+        match Pin::new(io).poll_write_all(cx, &mut to_send, true) {
+            Poll::Pending => {
+                // invariant: BufIo must have taken control of to_send buf.
+                assert!(to_send.is_none());
+                // Fall through do state change. The Pending will be caught
+                // when looping in drive() and doing poll_finish_pending_write.
+            }
+            Poll::Ready(v) => v?,
+        }
+
+        let next_state = State::RecvRes(Bidirect {
+            handle,
+            response_allows_reuse: false, // set later in poll_response()
+            holder: None,
+        });
+
+        Ok(Some(next_state)).into()
+    }
+}
+
+/// State where we both wait for a server response as well as sending a request body.
+struct Bidirect {
+    // The request and means to communicate with the user.
+    handle: Handle,
+    /// Tells whether the response headers/version allows reuse of the connection.
+    /// Set by Bidirect::poll_response() when response is received.
+    response_allows_reuse: bool,
+    /// Holds the received a response whle we are not finished sending the request body.
+    holder: Option<(Sender<io::Result<Vec<u8>>>, LimitRead)>,
+}
+
+impl Bidirect {
+    #[instrument(skip(self, cx, io))]
+    fn poll_bidirect<S>(
+        &mut self,
+        cx: &mut Context,
+        io: &mut BufIo<S>,
+    ) -> Poll<io::Result<Option<State>>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            if self.handle.res_tx.is_none() && self.handle.body_rx.is_none() {
+                break;
+            }
+
+            let mut res_tx_pending = false;
+            let mut body_tx_pending = false;
+
+            if self.handle.res_tx.is_some() {
+                match self.poll_response(cx, io) {
+                    Poll::Pending => {
+                        res_tx_pending = true;
+                    }
+                    Poll::Ready(v) => v?,
+                }
+            }
+
+            if self.handle.body_rx.is_some() {
+                match self.poll_send_body(cx, io) {
+                    Poll::Pending => {
+                        body_tx_pending = true;
+                    }
+                    Poll::Ready(v) => v?,
+                }
+            }
+
+            if res_tx_pending && body_tx_pending {
+                return Poll::Pending;
+            }
+        }
+
+        let request_allows_reuse =
+            allow_reuse(self.handle.req.headers(), self.handle.req.version());
+
+        let next_state = if let Some(holder) = self.holder.take() {
+            let (body_tx, limit) = holder;
+
+            let brec = BodyReceiver {
+                request_allows_reuse,
+                response_allows_reuse: self.response_allows_reuse,
+                limit,
+                body_tx,
+            };
+
+            Some(State::RecvBody(brec))
+        } else {
+            if request_allows_reuse && self.response_allows_reuse {
+                trace!("No response body, reuse connection");
+                Some(State::SendReq(SendReq))
+            } else {
+                trace!("No response body, reuse not allowed");
+                None
+            }
+        };
+
+        Ok(next_state).into()
+    }
+
+    #[instrument(skip(self, cx, io))]
+    fn poll_response<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<io::Result<()>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let res = ready!(poll_for_crlfcrlf(cx, io, try_parse_res))??;
+
+        // invariant: poll_for_crlfcrlf should provide a full header and
+        //            try_parse_res should not be able to get a partial response.
+        let res = res.expect("Parsed partial response");
+
+        self.response_allows_reuse = allow_reuse(res.headers(), res.version());
+
+        let limit = LimitRead::from_headers(res.headers(), res.version(), true);
+
+        // https://tools.ietf.org/html/rfc7230#page-31
+        // Any response to a HEAD request and any response with a 1xx
+        // (Informational), 204 (No Content), or 304 (Not Modified) status
+        // code is always terminated by the first empty line after the
+        // header fields, regardless of the header fields present in the
+        // message, and thus cannot contain a message body.
+        let status = res.status();
+        let is_no_body = limit.is_no_body()
+            || self.handle.req.method() == http::Method::HEAD
+            || status.is_informational()
+            || status == http::StatusCode::NO_CONTENT
+            || status == http::StatusCode::NOT_MODIFIED;
+
+        // TODO: handle CONNECT with a special state where connection becomes a tunnel
+
+        // bounded to have backpressure if client is reading slowly.
+        let (body_tx, body_rx) = Receiver::new(1);
+
+        // If there isn't a body, don't sent a holder. This is picked up in poll_bidirect to know
+        // which state is the next.
+        self.holder = if is_no_body {
+            None
+        } else {
+            Some((body_tx, limit))
+        };
+
+        let recv = RecvStream::new(body_rx, is_no_body, None);
+
+        let (parts, _) = res.into_parts();
+        let res = http::Response::from_parts(parts, recv);
+
+        // Taking the res_tx indicates to poll_bidirect that response is received.
+        let res_tx = self.handle.res_tx.take().expect("Missing res_tx");
+
+        if !res_tx.send(Ok(res)) {
+            // res_tx is unbounded, the only error possible is that the
+            // response future is dropped and client is not interested in response.
+            // This is not an error, we continue to drive the connection.
+            trace!("Failed to send http::Response to ResponseFuture");
         }
 
         Ok(()).into()
     }
 
-    fn drive_state(&mut self, cx: &mut Context, pending_io: &mut bool) -> Poll<io::Result<bool>> {
-        trace!("drive_state: {:?}", self.state);
+    #[instrument(skip(self, cx, io))]
+    fn poll_send_body<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<io::Result<()>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let body_rx = self.handle.body_rx.as_mut().unwrap();
 
-        match &mut self.state {
-            State::Empty => {
-                // invariant: Empty is just a placeholder.
-                panic!("State::Empty in drive_state");
+        let (chunk, end) = match ready!(Pin::new(body_rx).poll_recv(cx, true)) {
+            Some(v) => v,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "SendStream dropped before sending entire body",
+                ))
+                .into();
             }
+        };
 
-            State::Waiting => {
-                // try get the next request.
-                let next = ready!(Pin::new(&mut self.req_rx).poll_recv(cx, true));
+        // invariant: io must not be blocked now.
+        assert!(io.can_poll_write());
 
-                if let Some(h) = next {
-                    trace!("Waiting => SendReq");
-                    self.state = State::SendReq(h);
-                } else {
-                    // sender has closed, no more requests to come
-                    trace!("Request sender closed");
-                    return Ok(false).into();
-                }
-            }
+        let mut to_send = Some(&chunk[..]);
 
-            State::SendReq(h) => {
-                // invariant: should be no bytes waiting to be written at this point.
-                assert!(self.to_write.is_empty());
+        if end {
+            // By removing this we both signal to SendStream that no more body can
+            // be sent, as well as poll_bidirect() that we're done sending body.
+            self.handle.body_rx = None;
+        }
 
-                // prep size.
-                self.to_write.resize(MAX_REQUEST_SIZE, 0);
-
-                let amount = write_http1x_req(&h.req, &mut self.to_write)?;
-
-                // scale down
-                self.to_write.resize(amount, 0);
-                self.to_write_flush_after = true;
-
-                // see if the request allows for reuse.
-                let allow_reuse = allow_reuse(h.req.headers(), h.req.version());
-
-                // if we don't expect a request body, we mark the next state as being
-                // done for send body already.
-                let done_req_body = h.no_send_body;
-
-                let handle = self.state.take_handle();
-
-                trace!("SendReq => RecvRes");
-                self.state = State::RecvRes(Bidirect {
-                    handle,
-                    done_req_body,
-                    done_response: false,
-                    allow_reuse,
-                    holder: None,
-                });
-            }
-
-            State::RecvRes(b) => {
-                // This state does two things. It both sends a request body (if indicated by
-                // headers) at the same time as receiving a response.
-
-                let mut req_body_pending = false;
-
-                if !b.done_response {
-                    let res = match poll_for_crlfcrlf(cx, &mut self.io, try_parse_res) {
-                        Poll::Pending => {
-                            *pending_io = true;
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(v) => v??,
-                    };
-
-                    // invariant: poll_for_crlfcrlf should provide a full header and
-                    //            try_parse_res should not be able to get a partial response.
-                    let res = res.expect("Parsed partial response");
-
-                    // the allow_reuse flag will be false if request was sent with connection: close.
-                    if b.allow_reuse {
-                        // request allowed reused, now check if response does.
-                        b.allow_reuse = allow_reuse(res.headers(), res.version());
-                    }
-
-                    // we have a response for sure.
-                    trace!("done_response: true");
-                    b.done_response = true;
-
-                    let limit = LimitRead::from_headers(res.headers(), res.version(), true);
-
-                    // https://tools.ietf.org/html/rfc7230#page-31
-                    // Any response to a HEAD request and any response with a 1xx
-                    // (Informational), 204 (No Content), or 304 (Not Modified) status
-                    // code is always terminated by the first empty line after the
-                    // header fields, regardless of the header fields present in the
-                    // message, and thus cannot contain a message body.
-                    let status = res.status();
-                    let is_no_body = limit.is_no_body()
-                        || b.handle.req.method() == http::Method::HEAD
-                        || status.is_informational()
-                        || status == http::StatusCode::NO_CONTENT
-                        || status == http::StatusCode::NOT_MODIFIED;
-
-                    // TODO: handle CONNECT with a special state where connection becomes a tunnel
-
-                    // bounded to have backpressure if client is reading slowly.
-                    let (tx_body, rx_body) = Receiver::new(1);
-
-                    // holder indicates whether we expect a body.
-                    b.holder = if is_no_body {
-                        None
-                    } else {
-                        Some((tx_body, limit))
-                    };
-
-                    let recv = RecvStream::new(rx_body, None, is_no_body);
-
-                    let (parts, _) = res.into_parts();
-                    let res = http::Response::from_parts(parts, recv);
-
-                    // invariant: the oneshot handle should only exist once.
-                    let res_tx = b.handle.res_tx.take().expect("Missing res_tx");
-
-                    if !res_tx.send(Ok(res)) {
-                        // res_tx is unbounded, the only error possible is that the
-                        // response future is dropped and client is not interested in response.
-                        // This is not an error, we continue to drive the connection.
-                        trace!("Failed to send http::Response to ResponseFuture");
-                    }
-                }
-
-                if !b.done_req_body {
-                    // Not done sending a request body. Try get a body chunk to send.
-                    match Pin::new(&mut b.handle.rx_body).poll_recv(cx, !*pending_io) {
-                        Poll::Pending => {
-                            // Pending is ok, it means the SendBody has not sent any chunk.
-                            trace!("Read req_body: Pending");
-                            req_body_pending = true;
-                        }
-
-                        Poll::Ready(Some((mut chunk, end))) => {
-                            trace!("Read req_body len: {}, end: {}", chunk.len(), end);
-
-                            // Got a chunk to send
-                            if self.to_write.is_empty() {
-                                self.to_write = chunk;
-                            } else {
-                                self.to_write.append(&mut chunk);
-                            }
-                            self.to_write_flush_after = false;
-
-                            // Sender signalled end of stream
-                            if end {
-                                trace!("done_req_body (end): true");
-                                b.done_req_body = true;
-                            }
-
-                            // loop to try write body.
-                            return Ok(true).into();
-                        }
-
-                        Poll::Ready(None) => {
-                            // No more body chunks to be expected, SendBody was dropped.
-                            trace!("done_req_body (None): true");
-                            b.done_req_body = true;
-                        }
-                    }
-                }
-
-                // only proceed out of this state if we have both finished sending a request
-                // body and received a response header.
-                if b.done_req_body && b.done_response {
-                    // TODO: We could validate we actually sent as much body data that was
-                    // declared by a content-length header and/or that we sent the chunked
-                    // indication for complete. The spec doesn't mention this case specifically,
-                    // but it's clearly in "the spirit" to not send half messages.
-                    // https://tools.ietf.org/html/rfc7230#page-33
-
-                    if let Some((tx_body, limit)) = b.holder.take() {
-                        // carry flag over
-                        let allow_reuse = b.allow_reuse;
-
-                        // expect a response body.
-                        let handle = self.state.take_handle();
-
-                        trace!("RecvRes => RecvBody");
-                        self.state = State::RecvBody(BodyReceiver {
-                            handle,
-                            tx_body,
-                            limit,
-                            recv_buf: FastBuf::with_capacity(READ_BUF_INIT_SIZE),
-                            allow_reuse,
-                        });
-                    } else {
-                        // expect no response body.
-                        if b.allow_reuse {
-                            // we can reuse connection
-                            trace!("RecvRes => Waiting (expect no body)");
-                            self.state = State::Waiting;
-                        } else {
-                            // drop connection
-                            trace!("Connection is not reusable");
-                            return Ok(false).into();
-                        }
-                    }
-
-                    // loop
-                    return Ok(true).into();
-                }
-
-                // invariant: the only way we can be here is if the request body is
-                //            expected and pending.
-                assert!(req_body_pending);
+        match Pin::new(io).poll_write_all(cx, &mut to_send, end) {
+            Poll::Pending => {
+                // invariant: BufIo must have taken the buffer
+                assert!(to_send.is_none());
                 return Poll::Pending;
             }
+            Poll::Ready(v) => v?,
+        }
 
-            State::RecvBody(r) => {
-                if !r.recv_buf.is_empty() {
-                    trace!("tx_body try send chunk");
-                    if !ready!(Pin::new(&r.tx_body).poll_ready(cx, true)) {
-                        // receiver of body chunks is dropped, that's ok.
-                    }
+        Ok(()).into()
+    }
+}
 
-                    let chunk = r.recv_buf.take_vec();
+struct BodyReceiver {
+    request_allows_reuse: bool,
+    response_allows_reuse: bool,
+    limit: LimitRead,
+    body_tx: Sender<io::Result<Vec<u8>>>,
+}
 
-                    // Since we poll_ready above, the error here is that the receiver is gone,
-                    // which isn't a problem.
-                    r.tx_body.send(Ok(chunk));
+impl BodyReceiver {
+    #[instrument(skip(self, cx, io))]
+    fn poll_read_body<S>(
+        &mut self,
+        cx: &mut Context,
+        io: &mut BufIo<S>,
+    ) -> Poll<io::Result<Option<State>>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            if self.limit.is_complete() {
+                break;
+            }
 
-                    trace!("tx_body chunk sent");
+            if !ready!(Pin::new(&self.body_tx).poll_ready(cx, true)) {
+                // RecvStream is dropped, that's ok we will receive and drop entire body.
+            }
 
-                    // loop
-                    return Ok(true).into();
+            let mut buf = FastBuf::with_capacity(MAX_REQUEST_SIZE);
+
+            let mut read_into = buf.borrow();
+
+            let amount = ready!(self.limit.poll_read(cx, io, &mut read_into))?;
+
+            if amount > 0 {
+                read_into.add_len(amount);
+
+                if !self.body_tx.send(Ok(buf.into_vec())) {
+                    // RecvStream is dropped, that's ok we will receive and drop entire body.
                 }
+            } else if !self.limit.is_complete() {
+                // https://tools.ietf.org/html/rfc7230#page-32
+                // If the sender closes the connection or
+                // the recipient times out before the indicated number of octets are
+                // received, the recipient MUST consider the message to be
+                // incomplete and close the connection.
+                //
+                // https://tools.ietf.org/html/rfc7230#page-33
+                // A client that receives an incomplete response message, which can
+                // occur when a connection is closed prematurely or when decoding a
+                // supposedly chunked transfer coding fails, MUST record the message as
+                // incomplete.
 
-                // invariant: if we're here, the recv_buffer must be empty.
-                assert!(r.recv_buf.is_empty());
-
-                let mut read_into = r.recv_buf.borrow();
-
-                // read self.io through the limiter to stop reading when we are
-                // in place for the next request.
-                let res = match r.limit.poll_read(cx, &mut self.io, &mut read_into[..]) {
-                    Poll::Pending => {
-                        *pending_io = true;
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(v) => v,
-                };
-                trace!("Read res_body: ({:?})", res);
-                let amount = res?;
-
-                if amount > 0 {
-                    // commit additional len to buf
-                    read_into.add_len(amount);
-
-                    // loop
-                    return Ok(true).into();
-                } else {
-                    // scale buffer back.
-                    drop(read_into);
-
-                    // ensure the limiter was complete, or drop the connection.
-                    if !r.limit.is_complete() {
-                        // https://tools.ietf.org/html/rfc7230#page-32
-                        // If the sender closes the connection or
-                        // the recipient times out before the indicated number of octets are
-                        // received, the recipient MUST consider the message to be
-                        // incomplete and close the connection.
-                        //
-                        // https://tools.ietf.org/html/rfc7230#page-33
-                        // A client that receives an incomplete response message, which can
-                        // occur when a connection is closed prematurely or when decoding a
-                        // supposedly chunked transfer coding fails, MUST record the message as
-                        // incomplete.
-                        trace!("Close because read body is not complete");
-                        const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
-                        return Err(io::Error::new(EOF, "Partial body")).into();
-                    }
-
-                    if r.allow_reuse && r.limit.is_reusable() {
-                        // No more response body. ready to handle next request.
-                        // NB. This drops the r.tx_body which means the RecvStream will
-                        // read a 0 amount on next try.
-                        trace!("RecvBody => Waiting");
-                        self.state = State::Waiting;
-                    } else {
-                        // This connection can not be reused, could for instance be http/1.0
-                        // without connection: keep-alive.
-                        trace!("Connection is not reusable");
-                        return Ok(false).into();
-                    }
-                }
+                trace!("Close because read body is not complete");
+                const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
+                return Err(io::Error::new(EOF, "Partial body")).into();
             }
         }
 
-        Ok(true).into()
+        let next_state = if self.request_allows_reuse
+            && self.response_allows_reuse
+            && self.limit.is_reusable()
+        {
+            trace!("Reuse connection");
+            Some(State::SendReq(SendReq))
+        } else {
+            trace!("Connection is not reusable");
+            None
+        };
+
+        Ok(next_state).into()
     }
 }
 
 impl fmt::Debug for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            State::Waiting => write!(f, "Waiting")?,
-            State::SendReq(h) => write!(f, "SendReq: {:?}", h.req)?,
-            State::RecvRes(b) => write!(
-                f,
-                "RecvRes done_req_body: {}, done_response: {}",
-                b.done_req_body, b.done_response
-            )?,
-            State::RecvBody(_) => write!(f, "RecvBody")?,
-            State::Empty => write!(f, "Empty")?,
+            State::SendReq(_) => write!(f, "SendReq"),
+            State::RecvRes(_) => write!(f, "RecvRes"),
+            State::RecvBody(_) => write!(f, "RecvBody"),
         }
-        Ok(())
     }
 }
 
 impl fmt::Debug for SendRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SendRequest")
     }
 }
 
 impl fmt::Debug for ResponseFuture {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ResponseFuture")
     }
 }
 
 impl<S> fmt::Debug for Connection<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Connection")
     }
 }

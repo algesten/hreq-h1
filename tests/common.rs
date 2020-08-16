@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use async_std::net::{TcpListener, TcpStream};
-use futures_io::AsyncBufRead;
+use futures_io::AsyncRead;
 use futures_util::future::poll_fn;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use hreq_h1::buf_reader::BufIo;
@@ -30,7 +30,7 @@ where
         let mut brd = BufIo::with_capacity(16_384, tcp);
 
         loop {
-            let head = match read_header(&mut brd).await {
+            let head = match test_read_header(&mut brd).await {
                 Ok(v) => v,
                 Err(_e) => {
                     // client closed the connection
@@ -172,7 +172,8 @@ where
     Ok(Connector(addr))
 }
 
-pub async fn read_header<S: AsyncBufRead + Unpin>(io: &mut S) -> Result<String, Error> {
+#[tracing::instrument(skip(io))]
+pub async fn test_read_header<S: AsyncRead + Unpin>(io: &mut BufIo<S>) -> Result<String, Error> {
     Ok(poll_fn(|cx| {
         hreq_h1::http11::poll_for_crlfcrlf(cx, io, |buf| String::from_utf8(buf.to_vec()).unwrap())
     })

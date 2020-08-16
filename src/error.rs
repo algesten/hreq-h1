@@ -14,19 +14,19 @@ pub enum Error {
     Http(http::Error),
 }
 
-impl Error {
-    pub(crate) fn into_io(self) -> io::Error {
-        match self {
-            Error::Io(i) => i,
-            Error::User(e) => io::Error::new(io::ErrorKind::Other, e),
-            Error::Http11Parser(e) => io::Error::new(io::ErrorKind::Other, e),
-            Error::Http(e) => io::Error::new(io::ErrorKind::Other, e),
-        }
-    }
-}
+// impl Error {
+//     pub(crate) fn into_io(self) -> io::Error {
+//         match self {
+//             Error::Io(i) => i,
+//             Error::User(e) => io::Error::new(io::ErrorKind::Other, e),
+//             Error::Http11Parser(e) => io::Error::new(io::ErrorKind::Other, e),
+//             Error::Http(e) => io::Error::new(io::ErrorKind::Other, e),
+//         }
+//     }
+// }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::User(v) => write!(f, "{}", v),
             Error::Io(v) => fmt::Display::fmt(v, f),

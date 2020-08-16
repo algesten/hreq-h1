@@ -1,7 +1,9 @@
-use crate::AsyncBufRead;
+use crate::buf_reader::BufIo;
+use crate::AsyncRead;
 use crate::Error;
 use futures_util::ready;
 use http::header::{HeaderName, HeaderValue};
+use std::fmt::Debug;
 use std::io;
 use std::io::Write;
 use std::pin::Pin;
@@ -246,19 +248,27 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error>
 /// Helper to poll for request or response.
 ///
 /// It looks out for \r\n\r\n, which indicates the end of the headers and body begins.
-pub fn poll_for_crlfcrlf<S, F, T>(cx: &mut Context, io: &mut S, f: F) -> Poll<io::Result<T>>
+#[instrument(skip(cx, io, f))]
+pub fn poll_for_crlfcrlf<S, F, T>(cx: &mut Context, io: &mut BufIo<S>, f: F) -> Poll<io::Result<T>>
 where
-    S: AsyncBufRead + Unpin,
+    S: AsyncRead + Unpin,
     F: FnOnce(&[u8]) -> T,
-    T: std::fmt::Debug,
+    T: Debug,
 {
+    trace!("try find header");
+
     const END_OF_HEADER: &[u8] = &[b'\r', b'\n', b'\r', b'\n'];
     let mut end_index = 0; // index into END_OF_HEADER
 
     let mut buf_index = 0; // index into buf
 
+    // first loop we use whatever is in poll_fill_buf, second loop we
+    // really must read more (since we didn't get to end);
+    let mut force_append = false;
+
     loop {
-        let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx))?;
+        let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx, force_append))?;
+        force_append = true;
 
         // buffer did not grow. that means end_of_file in underlying reader.
         if buf.len() == buf_index {
@@ -275,6 +285,7 @@ where
 
                 // convert to whatever caller wants.
                 let ret = f(&buf[0..buf_index]);
+                trace!("Parsed header: {:?}", ret);
 
                 // discard the amount used from buffer.
                 Pin::new(&mut *io).consume(buf_index);

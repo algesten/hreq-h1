@@ -57,17 +57,14 @@ use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::mpsc::{Receiver, Sender};
-use crate::try_write::try_write;
 use crate::Error;
 use crate::RecvStream;
 use crate::SendStream;
 use crate::{AsyncRead, AsyncWrite};
-use futures_io::AsyncBufRead;
 use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::fmt;
 use std::io;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -82,35 +79,18 @@ pub fn handshake<S>(io: S) -> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    Connection(Arc::new(Mutex::new(Codec::new(io))), PhantomData)
+    Connection(Arc::new(Mutex::new(Codec::new(io))))
 }
 
 /// Server connection for accepting incoming requests.
 ///
 /// See [module level doc](index.html) for an example.
-//
-// NB: The PhantomData here is to maintain API parity with h2. Keeping Connection generic over <S>
-// gives us a future option to make a better impl that doesn't hide the IO behind a Box<dyn trait>.
-pub struct Connection<S>(Arc<Mutex<Codec>>, PhantomData<S>);
+pub struct Connection<S>(Arc<Mutex<Codec<S>>>);
 
 impl<S> Connection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    #[instrument(skip(self, cx))]
-    fn poll_accept(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
-        let this = self.get_mut();
-
-        let inner = this.0.clone();
-
-        let mut lock = this.0.lock().unwrap();
-
-        lock.poll_drive(cx, true, inner, true, true)
-    }
-
     /// Accept a new incoming request to handle. One must accept new requests continuously
     /// to "drive" the connection forward, also for the already accepted requests.
     pub async fn accept(
@@ -124,13 +104,28 @@ where
         poll_fn(|cx| Pin::new(&mut self).poll_close(cx)).await;
     }
 
+    #[instrument(skip(self, cx))]
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+        let this = self.get_mut();
+
+        let inner = this.0.clone();
+
+        let mut lock = this.0.lock().unwrap();
+
+        lock.poll_server(cx, inner, true, true)
+    }
+
+    #[instrument(skip(self, cx))]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let inner = self.0.clone();
 
-        let mut codec = self.0.lock().unwrap();
+        let mut lock = self.0.lock().unwrap();
 
         // It doesn't matter what the return value is, we just need it to not be pending.
-        ready!(codec.poll_drive(cx, true, inner.clone(), false, false));
+        ready!(lock.poll_server(cx, inner, false, true));
 
         ().into()
     }
@@ -140,7 +135,7 @@ where
 ///
 /// See [module level doc](index.html) for an example.
 pub struct SendResponse {
-    inner: Arc<Mutex<Codec>>,
+    drive_external: Box<dyn DriveExternal>,
     tx_res: Sender<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
 }
 
@@ -180,7 +175,9 @@ impl SendResponse {
             || status == http::StatusCode::NO_CONTENT
             || status == http::StatusCode::NOT_MODIFIED;
 
-        let send = SendStream::new(tx_body, limit, ended, Some(self.inner));
+        let drive_external = Some(self.drive_external);
+
+        let send = SendStream::new(tx_body, limit, ended, drive_external);
 
         if !self.tx_res.send((response, ended, rx_body)) {
             Err(io::Error::new(io::ErrorKind::Other, "Connection closed"))?;
@@ -189,567 +186,492 @@ impl SendResponse {
         Ok(send)
     }
 }
-
-pub(crate) struct Codec {
-    io: Box<dyn Io>,
+pub(crate) struct Codec<S> {
+    io: BufIo<S>,
     state: State,
-    // current bytes to be written
-    to_write: Vec<u8>,
-    to_write_flush_after: bool,
-    // buffer to receive next request into, and then body bytes
-    read_buf: FastBuf,
+}
+
+impl<S> Codec<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(io: S) -> Self {
+        Codec {
+            io: BufIo::with_capacity(READ_BUF_INIT_SIZE, io),
+            state: State::RecvReq(RecvReq),
+        }
+    }
+}
+
+impl<S> Codec<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[instrument(skip(self, cx, inner, want_next_req, register_on_user_input))]
+    fn poll_server(
+        &mut self,
+        cx: &mut Context,
+        inner: Arc<Mutex<Codec<S>>>,
+        want_next_req: bool,
+        register_on_user_input: bool,
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+        // Any error bubbling up closes the connection.
+        match self.drive(cx, inner, want_next_req, register_on_user_input) {
+            Poll::Ready(Some(Err(e))) => {
+                debug!("Close on error: {:?}", e);
+
+                trace!("{:?} => Closed", self.state);
+                self.state = State::Closed;
+
+                Some(Err(e)).into()
+            }
+            r @ _ => r,
+        }
+    }
+
+    fn drive(
+        &mut self,
+        cx: &mut Context,
+        inner: Arc<Mutex<Codec<S>>>,
+        want_next_req: bool,
+        register_on_user_input: bool,
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+        loop {
+            ready!(Pin::new(&mut self.io).poll_finish_pending_write(cx))?;
+
+            match &mut self.state {
+                State::RecvReq(h) => {
+                    // poll_drive() called with the intention of just driving server state
+                    // and not to handle the next read request.
+                    if !want_next_req {
+                        return None.into();
+                    }
+
+                    let (next_req, next_state) = ready!(h.poll_next_req(cx, inner, &mut self.io))?;
+
+                    trace!("RecvReq => {:?}", next_state);
+                    self.state = next_state;
+
+                    return Some(Ok(next_req)).into();
+                }
+                State::SendRes(h) => {
+                    let next_state =
+                        ready!(h.poll_bidirect(cx, &mut self.io, register_on_user_input))?;
+
+                    trace!("SendRes => {:?}", next_state);
+                    self.state = next_state;
+                }
+                State::SendBody(h) => {
+                    let next_state =
+                        ready!(h.poll_send_body(cx, &mut self.io, register_on_user_input))?;
+
+                    trace!("SendBody => {:?}", next_state);
+                    self.state = next_state;
+                }
+                State::Closed => {
+                    // Nothing to do
+                    return None.into();
+                }
+            }
+        }
+    }
 }
 
 enum State {
-    /// Waiting for the next request.
-    Waiting,
-    /// Receive request.
-    RecvReq(Option<http::Request<()>>),
+    /// Receive next request.
+    RecvReq(RecvReq),
     /// Send response, and (if appropriate) receive request body.
     SendRes(Bidirect),
     /// Send response body.
     SendBody(BodySender),
-    /// Closed
+    /// Closed, error or cleanly.
     Closed,
 }
 
-/// State where can both send a response and receive a request body, if appropriate.
-struct Bidirect {
-    limit: LimitRead,
-    tx_body: Option<Sender<io::Result<Vec<u8>>>>,
-    rx_res: Receiver<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
-    done_req_body: bool,
-    done_response: bool,
-    /// Placeholder used if we received a response but are not finished
-    /// sending the request body.
-    holder: Option<(bool, LimitWrite, Option<Receiver<(Vec<u8>, bool)>>)>,
-    reusable: bool,
-}
-
-struct BodySender {
-    rx_body: Receiver<(Vec<u8>, bool)>,
-    ended: bool,
-    reusable: bool,
-}
-
-#[derive(Debug)]
-enum DriveResult {
-    /// Next request arrived.
-    Request((http::Request<RecvStream>, SendResponse)),
-    /// Loop the drive_server again.
-    Loop,
-    /// No more requests.
-    Close,
-    /// State is Waiting and want_next_req is false.
-    Waiting,
-}
-
-impl Codec {
-    fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: S) -> Self {
-        Codec {
-            io: Box::new(IoAdapt(BufIo::with_capacity(READ_BUF_INIT_SIZE, io))),
-            state: State::Waiting,
-            to_write: vec![],
-            to_write_flush_after: false,
-            read_buf: FastBuf::with_capacity(READ_BUF_INIT_SIZE),
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            State::RecvReq(_) => write!(f, "RecvReq"),
+            State::SendRes(_) => write!(f, "SendRes"),
+            State::SendBody(_) => write!(f, "SendBody"),
+            State::Closed => write!(f, "Closed"),
         }
     }
+}
 
-    #[instrument(skip(self, cx, want_next_req, inner, pending_on_waiting))]
-    pub(crate) fn poll_drive(
+/// Waiting for the next request to arrive.
+///
+/// Reads a buffer for 2 x crlf to know we got an entire request header.
+struct RecvReq;
+
+impl RecvReq {
+    #[instrument(skip(self, cx, inner, io))]
+    fn poll_next_req<S>(
         &mut self,
         cx: &mut Context,
-        want_next_req: bool,
-        inner: Arc<Mutex<Codec>>,
-        pending_on_waiting: bool,
-        pending_on_non_io: bool,
-    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
-        loop {
-            // whether we have Poll::Pending on io.
-            let mut pending_io = false;
+        inner: Arc<Mutex<Codec<S>>>,
+        io: &mut BufIo<S>,
+    ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let req = ready!(poll_for_crlfcrlf(cx, io, try_parse_req))??;
 
-            // try write any bytes ready to be sent.
-            match try_write(
-                cx,
-                &mut self.io,
-                &mut self.to_write,
-                &mut self.to_write_flush_after,
-            ) {
-                Poll::Ready(v) => v?,
-                Poll::Pending => {
-                    pending_io = true;
-                }
-            }
+        // invariant: poll_for_crlfcrlf must have read a full request header.
+        let req = req.expect("Didn't read full request");
 
-            let ret = match self.drive_state(cx, want_next_req, inner.clone(), &mut pending_io) {
-                Poll::Pending => {
-                    if pending_io || pending_on_non_io {
-                        return Poll::Pending;
-                    } else {
-                        return Poll::Ready(None);
-                    }
-                }
-                Poll::Ready(v) => v?,
+        // Limiter to read the correct body amount from the socket.
+        let limit = LimitRead::from_headers(req.headers(), req.version(), false);
+
+        let request_allows_reuse = allow_reuse(req.headers(), req.version());
+
+        // https://tools.ietf.org/html/rfc7230#page-31
+        // Any response to a HEAD request ... is always terminated by the first
+        // empty line after the header fields, regardless of the header fields
+        // present in the message, and thus cannot contain a message body.
+        let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
+
+        // bound channel to get backpressure
+        let (tx_body, rx_body) = Receiver::new(1);
+
+        let (tx_res, rx_res) = Receiver::new(1);
+
+        // Prepare the new "package" to be delivered out of the poll loop.
+        let package = {
+            let drive_external1: Box<dyn DriveExternal> = Box::new(inner.clone());
+            let drive_external2: Box<dyn DriveExternal> = Box::new(inner);
+
+            let recv = RecvStream::new(rx_body, is_no_body, Some(drive_external1));
+
+            let (parts, _) = req.into_parts();
+            let req = http::Request::from_parts(parts, recv);
+
+            let send = SendResponse {
+                drive_external: drive_external2,
+                tx_res,
             };
 
-            match ret {
-                DriveResult::Request(p) => {
-                    return Poll::Ready(Some(Ok(p)));
-                }
+            (req, send)
+        };
 
-                DriveResult::Loop => {
-                    continue;
-                }
+        // Drop tx_body straight away if headers indicate we are not expecting any request body.
+        let tx_body = if limit.is_no_body() {
+            None
+        } else {
+            Some(tx_body)
+        };
 
-                DriveResult::Close => {
-                    return Poll::Ready(None);
-                }
+        let bidirect = Bidirect {
+            limit,
+            request_allows_reuse,
+            tx_body,
+            rx_res: Some(rx_res),
+            holder: None,
+        };
 
-                DriveResult::Waiting => {
-                    if pending_on_waiting {
-                        return Poll::Pending;
-                    } else {
-                        return Poll::Ready(None);
-                    }
-                }
-            }
-        }
+        Ok((package, State::SendRes(bidirect))).into()
     }
+}
 
-    fn drive_state(
+/// Both receive a request body (if headers indicate it), and
+/// send a response which is obtained from the library user.
+struct Bidirect {
+    // limiter/dechunker for reading incoming request body.
+    limit: LimitRead,
+    // remember this for when we are to go back into state RecvReq
+    request_allows_reuse: bool,
+    // send body chunks from socket to this sender.
+    tx_body: Option<Sender<io::Result<Vec<u8>>>>,
+    // receive a response (once), from this to pass to socket.
+    rx_res: Option<Receiver<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>>,
+    // Holder of data from rx_res used to receive/write a response body.
+    holder: Option<(bool, LimitWrite, Receiver<(Vec<u8>, bool)>)>,
+}
+
+impl Bidirect {
+    #[instrument(skip(self, cx, io))]
+    fn poll_bidirect<S>(
         &mut self,
         cx: &mut Context,
-        want_next_req: bool,
-        inner: Arc<Mutex<Codec>>,
-        pending_io: &mut bool,
-    ) -> Poll<Result<DriveResult, io::Error>> {
-        trace!("drive_state: {:?}", self.state);
-
-        match &mut self.state {
-            State::Closed => {
-                let span = trace_span!("Closed");
-                let _enter = span.enter();
-                return Poll::Ready(Ok(DriveResult::Close));
+        io: &mut BufIo<S>,
+        register_on_user_input: bool,
+    ) -> Poll<Result<State, Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Alternate between attempting to send a user response and receving more body chunks.
+        loop {
+            // We keep on looping until both these are None which signals
+            // the bidirect state is done.
+            if self.rx_res.is_none() && self.tx_body.is_none() {
+                break;
             }
 
-            State::Waiting => {
-                let span = trace_span!("Waiting");
-                let _enter = span.enter();
+            let mut send_resp_pending = false;
 
-                if !want_next_req {
-                    return Poll::Ready(Ok(DriveResult::Waiting));
-                }
-
-                match poll_for_crlfcrlf(cx, &mut self.io, try_parse_req) {
+            // Handle user sending a response.
+            if self.rx_res.is_some() {
+                // register_on_user_input means we should register a Waker when polling for a response
+                // from the user. We should not register two wakers for the same Context, which means
+                // if we get Pending while register_on_user_input is false, we can proceed to also drive IO.
+                match self.poll_send_resp(cx, io, register_on_user_input) {
                     Poll::Pending => {
-                        *pending_io = true;
-                        return Poll::Pending;
+                        send_resp_pending = true;
                     }
-                    Poll::Ready(Ok(res)) => {
-                        // unwrap error from failing to parse request header.
-                        let req = res?;
-
-                        // invariant: poll_for_crlfcrlf must have read a full request.
-                        let req = req.expect("Didn't read full request");
-
-                        // we got a full request header in buf
-                        trace!("Waiting => RecvReq");
-                        self.state = State::RecvReq(Some(req));
-                    }
-                    Poll::Ready(Err(e)) => {
-                        if e.kind() == io::ErrorKind::UnexpectedEof {
-                            trace!("Connection closed");
-                        } else {
-                            trace!("Other error when reading next: {:?}", e);
-                        }
-                        trace!("Waiting => Closed");
-                        self.state = State::Closed;
-                        return Poll::Ready(Ok(DriveResult::Close));
+                    Poll::Ready(v) => {
+                        v?;
                     }
                 }
             }
 
-            State::RecvReq(req) => {
-                let span = trace_span!("RecvReq");
-                let _enter = span.enter();
-
-                let req = req.take().expect("No request for RecvReq");
-
-                // Limiter to read the correct body amount from the socket.
-                let limit = LimitRead::from_headers(req.headers(), req.version(), false);
-
-                let reusable = allow_reuse(req.headers(), req.version());
-
-                // https://tools.ietf.org/html/rfc7230#page-31
-                // Any response to a HEAD request ... is always terminated by the first
-                // empty line after the header fields, regardless of the header fields
-                // present in the message, and thus cannot contain a message body.
-                let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
-
-                // bound channel to get backpressure
-                let (tx_body, rx_body) = Receiver::new(1);
-
-                let (tx_res, rx_res) = Receiver::new(1);
-
-                // Prepare the new "package" to be delivered out of the poll loop.
-                let package = {
-                    let recv = RecvStream::new(rx_body, Some(inner.clone()), is_no_body);
-
-                    let (parts, _) = req.into_parts();
-                    let req = http::Request::from_parts(parts, recv);
-
-                    let send = SendResponse { inner, tx_res };
-
-                    (req, send)
-                };
-
-                let done_req_body = limit.is_no_body();
-
-                trace!("RecvReq => SendRes");
-                self.state = State::SendRes(Bidirect {
-                    limit,
-                    tx_body: Some(tx_body),
-                    rx_res,
-                    done_req_body,
-                    done_response: false,
-                    holder: None,
-                    reusable,
-                });
-
-                // Exit drive with the packet.
-                return Ok(DriveResult::Request(package)).into();
-            }
-
-            State::SendRes(h) => {
-                // This state does two things, it both waits for the user of the lib
-                // to send a response at the same time as attempting to receive
-                // a request body (if headers indicate it).
-
-                let span = trace_span!("SendRes");
-                let _enter = span.enter();
-
-                let mut req_body_pending = false;
-
-                if !h.done_req_body {
-                    if !self.read_buf.is_empty() {
-                        if let Some(tx_body) = h.tx_body.as_mut() {
-                            trace!("tx_body try send chunk");
-                            if !ready!(Pin::new(&*tx_body).poll_ready(cx, !*pending_io)) {
-                                // receiver of body chunks is dropped, that's ok.
-                            }
-
-                            let chunk = self.read_buf.take_vec();
-
-                            // The RecvStream might be dropped, that's ok.
-                            tx_body.send(Ok(chunk));
-
-                            trace!("tx_body chunk sent");
-                            // loop to send off what was used received.
-                            return Ok(DriveResult::Loop).into();
-                        } else {
-                            // tx_body is gone, empty buffer
-                            trace!("tx_body not present, drop chunk");
-                            self.read_buf.empty();
-                        }
-                    }
-
-                    // invariant: we don't append to buffer, it must be sent to tx_body now.
-                    assert!(self.read_buf.is_empty());
-
-                    // When ref drops, buffer is resized.
-                    let mut read_into = self.read_buf.borrow();
-
-                    match h.limit.poll_read(cx, &mut self.io, &mut read_into) {
-                        Poll::Pending => {
-                            // Pending is ok, we can still make progress on sending the response.
-                            trace!("Read req_body: Pending");
-                            *pending_io = true;
-                            req_body_pending = true;
-                        }
-
-                        Poll::Ready(r) => {
-                            trace!("Read req_body: Ready ({:?})", r);
-
-                            // read error?
-                            let amount = r?;
-
-                            if amount == 0 {
-                                // remove the tx_body to indicate to receiver
-                                // side that no more data is coming.
-                                h.tx_body.take();
-                                trace!("done_req_body: true");
-                                h.done_req_body = true;
-                            }
-
-                            read_into.add_len(amount);
-
-                            // loop to send off what we received.
-                            return Ok(DriveResult::Loop).into();
-                        }
-                    }
-                }
-
-                if !h.done_response {
-                    let (res, end, rx_body) =
-                        match ready!(Pin::new(&mut h.rx_res).poll_recv(cx, !*pending_io)) {
-                            Some((res, end, rx_body)) => (res, end, Some(rx_body)),
-                            None => {
-                                // SendResponse was dropped before any response was sent.
-                                // That's a fault, but we can save the connection! :)
-                                warn!("SendResponse dropped without sending a response");
-                                (
-                                    http::Response::builder().status(500).body(()).unwrap(),
-                                    true,
-                                    None,
-                                )
-                            }
-                        };
-
-                    // got a response now.
-                    trace!("done_response: true");
-                    h.done_response = true;
-
-                    // invariant: there should be nothing to send now.
-                    assert!(self.to_write.is_empty());
-
-                    self.to_write.resize(MAX_RESPONSE_SIZE, 0);
-
-                    // invariant: we should be able to write _any_ response.
-                    let amount =
-                        write_http1x_res(&res, &mut self.to_write).expect("Write http::Response");
-
-                    self.to_write.resize(amount, 0);
-                    self.to_write_flush_after = true;
-
-                    // invariant: amount must match written buffer length
-                    assert_eq!(self.to_write.len(), amount);
-
-                    let limit = LimitWrite::from_headers(res.headers());
-
-                    // server can send connection: close
-                    let allow_reuse = allow_reuse(res.headers(), res.version());
-                    if h.reusable && !allow_reuse {
-                        h.reusable = false;
-                    }
-
-                    h.holder = Some((end, limit, rx_body));
-
-                    // write this
-                    return Ok(DriveResult::Loop).into();
-                }
-
-                if h.done_req_body && h.done_response {
-                    // invariant: We can't be here without sending a response..
-                    let (end, limit, rx_body) = h.holder.take().expect("Missing holder");
-
-                    // invariant: read_buf must been used up now.
-                    assert!(self.read_buf.is_empty());
-
-                    if end || limit.is_no_body() {
-                        // No response body to send.
-                        self.state = if h.reusable {
-                            trace!("SendRes => Waiting");
-                            State::Waiting
-                        } else {
-                            trace!("SendRes => Closed (not reusable)");
-                            State::Closed
-                        };
-                    } else if let Some(rx_body) = rx_body {
-                        trace!("SendRes => SendBody");
-                        self.state = State::SendBody(BodySender {
-                            rx_body,
-                            ended: false,
-                            reusable: h.reusable,
-                        });
-                    } else {
-                        // invariant: end or limit.is_no_body() means there is no body,
-                        unreachable!("No rx_body when expected");
-                    }
-
-                    return Ok(DriveResult::Loop).into();
-                }
-
-                // invariant: if we are here, it must be because request body is pending.
-                assert!(req_body_pending);
+            if register_on_user_input && send_resp_pending {
+                // A Waker is registered in mpsc::Receiver::poll_recv.
+                // We cannot continue with IO since that would risk
+                // registering wakers in multiple places.
                 return Poll::Pending;
             }
 
-            State::SendBody(b) => {
-                let span = trace_span!("SendBody");
-                let _enter = span.enter();
-
-                // If there is a chunk to write, we will wait until it's written.
-                // Doing Poll::Pending here is deliberate. Before drive_state() we have
-                // made as much progress in try_write as possible.
-                if *pending_io {
-                    trace!("Pending on io");
-                    return Poll::Pending;
-                }
-
-                if b.ended {
-                    self.state = if b.reusable {
-                        trace!("SendBody => Waiting");
-                        State::Waiting
-                    } else {
-                        trace!("SendBody => Closed (not reusable)");
-                        State::Closed
-                    };
-                    return Ok(DriveResult::Loop).into();
-                }
-
-                let next = ready!(Pin::new(&mut b.rx_body).poll_recv(cx, true));
-
-                if let Some((mut chunk, end)) = next {
-                    trace!("Body data to send len={}, end={}", chunk.len(), end);
-
-                    if end {
-                        b.ended = true;
-                    }
-
-                    // queue up next chunk to write out.
-                    if self.to_write.is_empty() {
-                        self.to_write = chunk;
-                    } else {
-                        self.to_write.append(&mut chunk);
-                    }
-                    self.to_write_flush_after = end;
-
-                    if b.ended && self.to_write.is_empty() {
-                        self.state = if b.reusable {
-                            trace!("SendBody => Waiting");
-                            State::Waiting
-                        } else {
-                            trace!("SendBody => Closed (not reusable)");
-                            State::Closed
-                        };
-                    }
-
-                    return Ok(DriveResult::Loop).into();
-                } else {
-                    // This is a fault, we are expecting more body chunks and
-                    // the SendStream was dropped.
-                    warn!("SendStream dropped before sending end_of_body");
-
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Unexpected end of body",
-                    ))
-                    .into();
-                }
+            // Read request body from socket and propagate to user.
+            if self.tx_body.is_some() {
+                ready!(self.poll_read_body(cx, io))?;
             }
         }
 
-        return Ok(DriveResult::Loop).into();
-    }
-}
+        // invariant: we must have the details required in holder.
+        let (no_body, limit, rx_body) = self.holder.take().expect("Holder of rx_body");
 
-// ***************** Helper to drive connection externally *************************
-
-pub(crate) trait ServerDrive {
-    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
-}
-
-impl ServerDrive for Arc<Mutex<Codec>> {
-    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-        let inner = self.clone();
-
-        // this shouldn't really have any contention.
-        let mut lock = self.lock().unwrap();
-
-        match lock.poll_drive(cx, false, inner, false, false) {
-            Poll::Pending => Poll::Pending,
-
-            Poll::Ready(Some(Ok(_))) => {
-                // invariant: we must not receive the next request here.
-                unreachable!("Got next request in poll_drive_external")
+        let next_state = if no_body || limit.is_no_body() {
+            if self.request_allows_reuse {
+                trace!("Request does not allow reuse");
+                State::Closed
+            } else {
+                trace!("No body to send");
+                State::RecvReq(RecvReq)
             }
+        } else {
+            State::SendBody(BodySender {
+                request_allows_reuse: self.request_allows_reuse,
+                rx_body,
+            })
+        };
 
-            Poll::Ready(Some(Err(e))) => Err(e.into_io()).into(),
-
-            Poll::Ready(None) => Ok(()).into(),
-        }
+        Ok(next_state).into()
     }
-}
 
-impl fmt::Debug for SendResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SendResponse")
-    }
-}
-
-// ***************** Boiler plate to hide IO behind a Box<dyn trait> ***************
-
-trait Io: AsyncBufRead + AsyncWrite + Unpin + Send + 'static {}
-
-struct IoAdapt<S>(S);
-
-impl<S> Io for IoAdapt<S> where S: AsyncBufRead + AsyncWrite + Unpin + Send + 'static {}
-
-impl<S> AsyncRead for IoAdapt<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
+    #[instrument(skip(self, cx, io, register_on_user_input))]
+    fn poll_send_resp<S>(
+        &mut self,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).poll_read(cx, buf)
-    }
-}
+        io: &mut BufIo<S>,
+        register_on_user_input: bool,
+    ) -> Poll<Result<(), Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // We shouldn't be here unless we have rx_res.
+        let rx_res = self.rx_res.as_mut().unwrap();
 
-impl<S> AsyncBufRead for IoAdapt<S>
-where
-    S: AsyncBufRead + AsyncWrite + Unpin,
-{
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<&[u8]>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).poll_fill_buf(cx)
-    }
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).consume(amt)
-    }
-}
+        if let Some((res, end, rx_body)) =
+            ready!(Pin::new(rx_res).poll_recv(cx, register_on_user_input))
+        {
+            // We got a response from the user.
 
-impl<S> AsyncWrite for IoAdapt<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).poll_write(cx, buf)
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).poll_flush(cx)
-    }
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.0).poll_close(cx)
-    }
-}
+            // Remember things for the next state, SendBody
+            let limit = LimitWrite::from_headers(res.headers());
+            self.holder = Some((end, limit, rx_body));
 
-impl fmt::Debug for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            State::Closed => write!(f, "Closed")?,
-            State::Waiting => write!(f, "Waiting")?,
-            State::RecvReq(_) => write!(f, "RecvReq")?,
-            State::SendRes(b) => write!(
-                f,
-                "SendRes done_req_body: {}, done_response: {}",
-                b.done_req_body, b.done_response
-            )?,
-            State::SendBody(_) => write!(f, "SendBody")?,
+            let mut buf = FastBuf::with_capacity(MAX_RESPONSE_SIZE);
+
+            let mut write_to = buf.borrow();
+
+            let amount = write_http1x_res(&res, &mut write_to[..])?;
+
+            write_to.add_len(amount);
+
+            let mut to_send = Some(&buf[..]);
+
+            // invariant: poll_drive deals with pending outgoing io before anything
+            //            else. at this point we should not have any pending write io.
+            assert!(io.can_poll_write());
+
+            match Pin::new(io).poll_write_all(cx, &mut to_send, true) {
+                Poll::Pending => {
+                    // invariant: Pending without "taking" all to_send bytes is a fault in BufIo
+                    assert!(to_send.is_none());
+                }
+                Poll::Ready(v) => v?,
+            }
+
+            // Remove rx_res since we don't need anything more from it. This makes
+            // poll_bidirect() not go into poll_send_resp anymore.
+            self.rx_res.take();
+        } else {
+            // The user dropped the SendResponse instance before sending a response.
+            // This is a user fault.
+            return Err(Error::User(format!(
+                "SendResponse dropped before sending any response"
+            )))
+            .into();
         }
-        Ok(())
+
+        Ok(()).into()
+    }
+
+    #[instrument(skip(self, cx, io))]
+    fn poll_read_body<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<Result<(), Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // We shouldn't be here unless we have tx_body.
+        let tx_body = self.tx_body.as_mut().unwrap();
+
+        // Ensure we can send off any incoming read chunk to the user. This makes for flow control.
+        if !ready!(Pin::new(&*tx_body).poll_ready(cx, true)) {
+            // User has dropped the RecvStream. That's ok, we will just discard
+            // the entire incoming body.
+        }
+
+        let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx, false))?;
+
+        if buf.is_empty() {
+            // End of incoming data before we have fulfilled the LimitRead.
+            // configured by the headers.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF before complete body received",
+            )
+            .into())
+            .into();
+        }
+
+        let mut chunk = FastBuf::with_capacity(buf.len());
+
+        let mut read_into = chunk.borrow();
+
+        let amount = ready!(self.limit.poll_read(cx, io, &mut read_into[..]))?;
+
+        if amount > 0 {
+            // consume read_into to reset chunk size back to correct length as per FastBuf contract.
+            read_into.add_len(amount);
+
+            tx_body.send(Ok(chunk.into_vec()));
+        } else {
+            // Remove tx_body Sender which indicates to the RecvStream that there is
+            // no more body chunks to come.
+            self.tx_body.take();
+        }
+
+        Ok(()).into()
+    }
+}
+
+/// Sender of a response body.
+struct BodySender {
+    request_allows_reuse: bool,
+    rx_body: Receiver<(Vec<u8>, bool)>,
+}
+
+impl BodySender {
+    #[instrument(skip(self, cx, io))]
+    fn poll_send_body<S>(
+        &mut self,
+        cx: &mut Context,
+        io: &mut BufIo<S>,
+        register_on_user_input: bool,
+    ) -> Poll<Result<State, Error>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Keep try to send body chunks until we got no more to send or Pending.
+        loop {
+            // Always abort on Pending, but register_on_user_input controls whether this resulted in
+            // any Waker being registered. This makes for flow control.
+            let next = ready!(Pin::new(&mut self.rx_body).poll_recv(cx, register_on_user_input));
+
+            // Pending writes must have been dealt with already at the beginning of poll_drive().
+            assert!(io.can_poll_write());
+
+            if let Some((chunk, end)) = next {
+                let mut buf = Some(&chunk[..]);
+
+                match Pin::new(&mut *io).poll_write_all(cx, &mut buf, end) {
+                    Poll::Pending => {
+                        // invariant: The buffer must still been taken by poll_write.
+                        assert!(buf.is_none());
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(v) => v?,
+                }
+
+                if end {
+                    let next_state = if self.request_allows_reuse {
+                        trace!("Request does not allow reuse");
+                        State::Closed
+                    } else {
+                        trace!("Finished sending body");
+                        State::RecvReq(RecvReq)
+                    };
+
+                    return Ok(next_state).into();
+                }
+            } else {
+                // This is a fault, we are expecting more body chunks and
+                // the SendStream was dropped.
+                warn!("SendStream dropped before sending end_of_body");
+
+                return Err(io::Error::new(io::ErrorKind::Other, "Unexpected end of body").into())
+                    .into();
+            }
+        }
     }
 }
 
 impl<S> std::fmt::Debug for Connection<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", "Connection")
+    }
+}
+
+impl fmt::Debug for SendResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "SendResponse")
+    }
+}
+
+pub(crate) trait DriveExternal: Send {
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), Error>>;
+}
+
+impl<S> DriveExternal for Arc<Mutex<Codec<S>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let inner = self.clone();
+
+        let mut lock = self.lock().unwrap();
+
+        match lock.poll_server(cx, inner, false, false) {
+            Poll::Pending => {
+                let pending_io = lock.io.pending_rx() || lock.io.pending_rx();
+
+                // Only propagate Pending if it was due to io. We send register_on_user_input
+                // false, which means that reading user input from SendResponse and SendStream
+                // will not have registered a Waker. Pending due to IO most propagate as Pending.
+                if pending_io {
+                    Poll::Pending
+                } else {
+                    Ok(()).into()
+                }
+            }
+            Poll::Ready(Some(Ok(_))) => {
+                // invariant: want_next_req is false, this should not happend.
+                unreachable!("Got next request in poll_drive_external");
+            }
+            // Propagate error
+            Poll::Ready(Some(Err(e))) => Err(e).into(),
+            //
+            Poll::Ready(None) => Ok(()).into(),
+        }
     }
 }

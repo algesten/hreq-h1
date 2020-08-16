@@ -30,7 +30,7 @@ async fn server_request_200_ok() -> Result<(), Error> {
 
     brd.write_all(b"GET /path HTTP/1.1\r\n\r\n").await?;
 
-    let head = common::read_header(&mut brd).await?;
+    let head = common::test_read_header(&mut brd).await?;
     assert_eq!(head, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n");
 
     let mut buf = [0; 2];
@@ -72,7 +72,7 @@ async fn server_big_body_clen() -> Result<(), Error> {
 
     brd.write_all(b"GET /path HTTP/1.1\r\n\r\n").await?;
 
-    let head = common::read_header(&mut brd).await?;
+    let head = common::test_read_header(&mut brd).await?;
     assert_eq!(head, "HTTP/1.1 200 OK\r\ncontent-length: 10485760\r\n\r\n");
 
     let mut total = 0;

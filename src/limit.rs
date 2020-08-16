@@ -104,10 +104,10 @@ impl LimitRead {
     }
 
     /// Try read some data.
-    pub fn poll_read<R: AsyncRead + Unpin>(
+    pub fn poll_read<S: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<S>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         match &mut self.limiter {
@@ -118,6 +118,8 @@ impl LimitRead {
         }
     }
 }
+
+use crate::buf_reader::BufIo;
 
 /// Reader limited by a set length.
 #[derive(Debug)]
@@ -139,7 +141,7 @@ impl ContentLengthRead {
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<R>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         assert!(!buf.is_empty(), "poll_read with len 0 buf");
@@ -192,7 +194,7 @@ impl ReadToEnd {
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
-        recv: &mut R,
+        recv: &mut BufIo<R>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         assert!(!buf.is_empty(), "poll_read with len 0 buf");
@@ -308,7 +310,7 @@ impl ContentLengthWrite {
 }
 
 impl fmt::Debug for LimitRead {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.limiter {
             ReadLimiter::ChunkedDecoder(_) => write!(f, "ChunkedDecoder")?,
             ReadLimiter::ContentLength(l) => write!(f, "ContenLength({})", l.limit)?,
@@ -320,7 +322,7 @@ impl fmt::Debug for LimitRead {
 }
 
 impl fmt::Debug for LimitWrite {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LimitWrite::ChunkedEncoder => write!(f, "ChunkedEncoder")?,
             LimitWrite::ContentLength(l) => write!(f, "ContentLength({})", l.limit)?,

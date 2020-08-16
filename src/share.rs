@@ -1,7 +1,6 @@
 use crate::limit::LimitWrite;
 use crate::mpsc::{Receiver, Sender};
-use crate::server::Codec;
-use crate::server::ServerDrive;
+use crate::server::DriveExternal;
 use crate::AsyncRead;
 use crate::Error;
 use futures_util::future::poll_fn;
@@ -9,7 +8,6 @@ use futures_util::ready;
 use std::fmt;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 /// Send some body data to a remote peer.
@@ -22,9 +20,7 @@ pub struct SendStream {
     tx_body: Sender<(Vec<u8>, bool)>,
     limit: LimitWrite,
     ended: bool,
-    // used in RecvStream originating in server to drive the connection
-    // from the RecvStream polling itelf.
-    server_inner: Option<Arc<Mutex<Codec>>>,
+    drive_external: Option<Box<dyn DriveExternal>>,
 }
 
 impl SendStream {
@@ -32,13 +28,41 @@ impl SendStream {
         tx_body: Sender<(Vec<u8>, bool)>,
         limit: LimitWrite,
         ended: bool,
-        server_inner: Option<Arc<Mutex<Codec>>>,
+        drive_external: Option<Box<dyn DriveExternal>>,
     ) -> Self {
         SendStream {
             tx_body,
             limit,
             ended,
-            server_inner,
+            drive_external,
+        }
+    }
+
+    /// Send one chunk of data. Use `end_of_body` to signal end of data.
+    ///
+    /// Alternate calls to this with calls to `ready` for flow control.
+    ///
+    /// When the body is constrained by a `content-length` header, this will only accept
+    /// the amount of bytes specified in the header. If there is too much data, the
+    /// function will error with a `Error::User`.
+    ///
+    /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
+    #[instrument(skip(self, data, end_of_body))]
+    pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
+        trace!("Send len={} end_of_body={}", data.len(), end_of_body);
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, cx))]
+    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        if let Some(drive_external) = &self.drive_external {
+            drive_external.poll_drive_external(cx)
+        } else {
+            Ok(()).into()
         }
     }
 
@@ -91,34 +115,6 @@ impl SendStream {
 
         Ok(()).into()
     }
-
-    fn poll_drive_server(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
-        let this = self.get_mut();
-
-        if let Some(server_inner) = &this.server_inner {
-            ready!(server_inner.poll_drive_external(cx))?;
-        }
-
-        Ok(()).into()
-    }
-
-    /// Send one chunk of data. Use `end_of_body` to signal end of data.
-    ///
-    /// Alternate calls to this with calls to `ready` for flow control.
-    ///
-    /// When the body is constrained by a `content-length` header, this will only accept
-    /// the amount of bytes specified in the header. If there is too much data, the
-    /// function will error with a `Error::User`.
-    ///
-    /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
-    #[instrument(skip(self, data, end_of_body))]
-    pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
-        trace!("Send len={} end_of_body={}", data.len(), end_of_body);
-        poll_fn(|cx| Pin::new(&mut *self).poll_drive_server(cx)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_drive_server(cx)).await?;
-        Ok(())
-    }
 }
 
 /// Receives a body from the remote peer.
@@ -131,24 +127,47 @@ pub struct RecvStream {
     rx_body: Receiver<io::Result<Vec<u8>>>,
     ready: Option<Vec<u8>>,
     index: usize,
-    // used in RecvStream originating in server to drive the connection
-    // from the RecvStream polling itelf.
-    server_inner: Option<Arc<Mutex<Codec>>>,
     ended: bool,
+    drive_external: Option<Box<dyn DriveExternal>>,
 }
 
 impl RecvStream {
     pub(crate) fn new(
         rx_body: Receiver<io::Result<Vec<u8>>>,
-        server_inner: Option<Arc<Mutex<Codec>>>,
         ended: bool,
+        drive_external: Option<Box<dyn DriveExternal>>,
     ) -> Self {
         RecvStream {
             rx_body,
             ready: None,
             index: 0,
-            server_inner,
             ended,
+            drive_external,
+        }
+    }
+
+    /// Read some body data into a given buffer.
+    ///
+    /// Ends when returned size is `0`.
+    #[instrument(skip(self, buf))]
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+        Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
+    }
+
+    /// Returns `true` if there is no more data to receive.
+    ///
+    /// Specifically any further call to `read` will result in `0` bytes read.
+    pub fn is_end_stream(&self) -> bool {
+        self.ended
+    }
+
+    #[instrument(skip(self, cx))]
+    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        if let Some(drive_external) = &self.drive_external {
+            drive_external.poll_drive_external(cx)
+        } else {
+            Ok(()).into()
         }
     }
 
@@ -161,11 +180,6 @@ impl RecvStream {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-
-        // must drive the connection if server.
-        if let Some(server_inner) = &this.server_inner {
-            ready!(server_inner.poll_drive_external(cx))?;
-        }
 
         if this.ended {
             return Ok(0).into();
@@ -208,21 +222,6 @@ impl RecvStream {
             }
         }
     }
-
-    /// Read some body data into a given buffer.
-    ///
-    /// Ends when returned size is `0`.
-    #[instrument(skip(self, buf))]
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
-    }
-
-    /// Returns `true` if there is no more data to receive.
-    ///
-    /// Specifically any further call to `read` will result in `0` bytes read.
-    pub fn is_end_stream(&self) -> bool {
-        self.ended
-    }
 }
 
 impl AsyncRead for RecvStream {
@@ -236,13 +235,13 @@ impl AsyncRead for RecvStream {
 }
 
 impl fmt::Debug for SendStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SendStream")
     }
 }
 
 impl fmt::Debug for RecvStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RecvStream")
     }
 }

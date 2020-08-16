@@ -30,7 +30,7 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
     brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
         .await?;
 
-    let head = common::read_header(&mut brd).await?;
+    let head = common::test_read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -72,7 +72,7 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
     )
     .await?;
 
-    let head = common::read_header(&mut brd).await?;
+    let head = common::test_read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -130,7 +130,7 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
     brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
         .await?;
 
-    let head = common::read_header(&mut brd).await?;
+    let head = common::test_read_header(&mut brd).await?;
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
