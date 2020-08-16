@@ -58,7 +58,7 @@
 //! [`Connection`]: struct.Connection.html
 //! [`SendRequest`]: struct.SendRequest.html
 
-use crate::buf_reader::BufReader;
+use crate::buf_reader::BufIo;
 use crate::err_closed;
 use crate::fast_buf::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF_INIT_SIZE};
@@ -213,7 +213,7 @@ where
 }
 
 struct Codec<S> {
-    io: BufReader<S>,
+    io: BufIo<S>,
     req_rx: Receiver<Handle>,
     to_write: Vec<u8>,
     to_write_flush_after: bool,
@@ -312,7 +312,7 @@ where
 {
     fn new(io: S, req_rx: Receiver<Handle>) -> Self {
         Codec {
-            io: BufReader::with_capacity(READ_BUF_INIT_SIZE, io),
+            io: BufIo::with_capacity(READ_BUF_INIT_SIZE, io),
             req_rx,
             to_write: Vec::with_capacity(MAX_REQUEST_SIZE),
             to_write_flush_after: false,

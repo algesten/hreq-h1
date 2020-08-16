@@ -1,5 +1,35 @@
 const MAX_CAPACITY: usize = 10 * 1024 * 1024;
 
+/// Buffer with a read start pointer moved by consume().
+#[derive(Debug)]
+pub(crate) struct ConsumeBuf {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ConsumeBuf {
+    pub fn new(buf: Vec<u8>) -> Self {
+        ConsumeBuf { buf, pos: 0 }
+    }
+
+    pub fn consume(&mut self, amount: usize) {
+        let new_pos = self.pos + amount;
+        assert!(new_pos <= self.buf.len());
+        self.pos = new_pos;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+impl std::ops::Deref for ConsumeBuf {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.buf[self.pos..]
+    }
+}
+
 #[derive(Debug)]
 /// Helper to manage a buf that can be resized without 0-ing.
 pub(crate) struct FastBuf(Vec<u8>);

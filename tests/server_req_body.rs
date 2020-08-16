@@ -1,5 +1,5 @@
 use futures_util::{AsyncReadExt, AsyncWriteExt};
-use hreq_h1::buf_reader::BufReader;
+use hreq_h1::buf_reader::BufIo;
 use hreq_h1::Error;
 
 mod common;
@@ -25,7 +25,7 @@ async fn server_request_with_body_clen() -> Result<(), Error> {
     .await?;
 
     let tcp = conn.connect().await?;
-    let mut brd = BufReader::with_capacity(8192, tcp);
+    let mut brd = BufIo::with_capacity(8192, tcp);
 
     brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 3\r\n\r\nOK\n")
         .await?;
@@ -65,7 +65,7 @@ async fn server_request_with_body_chunked() -> Result<(), Error> {
     .await?;
 
     let tcp = conn.connect().await?;
-    let mut brd = BufReader::with_capacity(8192, tcp);
+    let mut brd = BufIo::with_capacity(8192, tcp);
 
     brd.write_all(
         b"POST /path HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
@@ -125,7 +125,7 @@ async fn server_request_with_body_dropped() -> Result<(), Error> {
 
     let conn = Connector(addr);
     let tcp = conn.connect().await?;
-    let mut brd = BufReader::with_capacity(8192, tcp);
+    let mut brd = BufIo::with_capacity(8192, tcp);
 
     brd.write_all(b"POST /path HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
         .await?;

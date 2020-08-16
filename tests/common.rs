@@ -4,7 +4,7 @@ use async_std::net::{TcpListener, TcpStream};
 use futures_io::AsyncBufRead;
 use futures_util::future::poll_fn;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
-use hreq_h1::buf_reader::BufReader;
+use hreq_h1::buf_reader::BufIo;
 use hreq_h1::server::SendResponse;
 use hreq_h1::Error;
 use std::future::Future;
@@ -15,8 +15,8 @@ use std::sync::Once;
 pub async fn serve<F, R>(mut f: F) -> Result<Connector, io::Error>
 where
     F: Send + 'static,
-    F: FnMut(String, BufReader<TcpStream>, usize) -> R,
-    R: Future<Output = Result<(BufReader<TcpStream>, bool), Error>>,
+    F: FnMut(String, BufIo<TcpStream>, usize) -> R,
+    R: Future<Output = Result<(BufIo<TcpStream>, bool), Error>>,
     R: Send,
 {
     setup_logger();
@@ -27,7 +27,7 @@ where
     async_std::task::spawn(async move {
         let mut call_count = 1;
         let (tcp, _) = l.accept().await.expect("Accept failed");
-        let mut brd = BufReader::with_capacity(16_384, tcp);
+        let mut brd = BufIo::with_capacity(16_384, tcp);
 
         loop {
             let head = match read_header(&mut brd).await {

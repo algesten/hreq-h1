@@ -51,7 +51,7 @@
 //!
 //!
 
-use crate::buf_reader::BufReader;
+use crate::buf_reader::BufIo;
 use crate::fast_buf::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
@@ -247,7 +247,7 @@ enum DriveResult {
 impl Codec {
     fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: S) -> Self {
         Codec {
-            io: Box::new(IoAdapt(BufReader::with_capacity(READ_BUF_INIT_SIZE, io))),
+            io: Box::new(IoAdapt(BufIo::with_capacity(READ_BUF_INIT_SIZE, io))),
             state: State::Waiting,
             to_write: vec![],
             to_write_flush_after: false,
