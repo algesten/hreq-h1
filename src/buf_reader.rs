@@ -34,11 +34,13 @@ where
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
 
+        let cur_len = this.buf.len();
+
         // when this reference is dropped, the buffer size is reset back.
+        // this also extends the buffer with additional capacity if needed.
         let mut bref = this.buf.borrow();
 
-        // extend buffer to be able to read until capacity.
-        let read_into = &mut bref[..];
+        let read_into = &mut bref[cur_len..];
 
         match Pin::new(&mut this.inner).poll_read(cx, read_into) {
             Poll::Pending => {
