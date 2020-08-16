@@ -85,13 +85,9 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
-            let c = Arc::weak_count(&inner);
-
-            if c == 1 {
-                // no more senders to wake receiver
-                let mut lock = inner.lock().unwrap();
-                lock.wake_all()
-            }
+            // wake everyone, just in case
+            let mut lock = inner.lock().unwrap();
+            lock.wake_all()
         }
     }
 }

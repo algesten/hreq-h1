@@ -1,6 +1,5 @@
 use crate::buf_reader::BufIo;
 use crate::AsyncRead;
-use crate::Error;
 use futures_util::ready;
 use http::header::{HeaderName, HeaderValue};
 use std::fmt::Debug;
@@ -93,7 +92,7 @@ pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
 /// Write an http/1.x response to a buffer.
 #[allow(clippy::write_with_newline)]
 #[instrument(skip(res, buf))]
-pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, Error> {
+pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
 

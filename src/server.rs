@@ -96,7 +96,9 @@ where
     pub async fn accept(
         &mut self,
     ) -> Option<Result<(http::Request<RecvStream>, SendResponse), Error>> {
-        poll_fn(|cx| Pin::new(&mut *self).poll_accept(cx)).await
+        poll_fn(|cx| Pin::new(&mut *self).poll_accept(cx))
+            .await
+            .map(|v| v.map_err(|x| x.into()))
     }
 
     /// Wait until the connection has sent/flush all data and is ok to drop.
@@ -108,7 +110,7 @@ where
     fn poll_accept(
         self: Pin<&mut Self>,
         cx: &mut Context,
-    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         let this = self.get_mut();
 
         let inner = this.0.clone();
@@ -214,7 +216,7 @@ where
         inner: Arc<Mutex<Codec<S>>>,
         want_next_req: bool,
         register_on_user_input: bool,
-    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         // Any error bubbling up closes the connection.
         match self.drive(cx, inner, want_next_req, register_on_user_input) {
             Poll::Ready(Some(Err(e))) => {
@@ -235,7 +237,7 @@ where
         inner: Arc<Mutex<Codec<S>>>,
         want_next_req: bool,
         register_on_user_input: bool,
-    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
+    ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         loop {
             ready!(Pin::new(&mut self.io).poll_finish_pending_write(cx))?;
 
@@ -311,7 +313,7 @@ impl RecvReq {
         cx: &mut Context,
         inner: Arc<Mutex<Codec<S>>>,
         io: &mut BufIo<S>,
-    ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), Error>>
+    ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -389,13 +391,13 @@ struct Bidirect {
 }
 
 impl Bidirect {
-    #[instrument(skip(self, cx, io))]
+    #[instrument(skip(self, cx, io, register_on_user_input))]
     fn poll_bidirect<S>(
         &mut self,
         cx: &mut Context,
         io: &mut BufIo<S>,
         register_on_user_input: bool,
-    ) -> Poll<Result<State, Error>>
+    ) -> Poll<Result<State, io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -424,10 +426,16 @@ impl Bidirect {
                 }
             }
 
-            if register_on_user_input && send_resp_pending {
+            if send_resp_pending && (register_on_user_input || self.tx_body.is_none()) {
+                // If register_on_user_input:
                 // A Waker is registered in mpsc::Receiver::poll_recv.
                 // We cannot continue with IO since that would risk
                 // registering wakers in multiple places.
+                //
+                // If self.tx_body.is_none() we can't make progress on
+                // IO, and send_resp will not make progress by anything less
+                // than user input.
+
                 return Poll::Pending;
             }
 
@@ -464,7 +472,7 @@ impl Bidirect {
         cx: &mut Context,
         io: &mut BufIo<S>,
         register_on_user_input: bool,
-    ) -> Poll<Result<(), Error>>
+    ) -> Poll<Result<(), io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -508,9 +516,9 @@ impl Bidirect {
         } else {
             // The user dropped the SendResponse instance before sending a response.
             // This is a user fault.
-            return Err(Error::User(format!(
-                "SendResponse dropped before sending any response"
-            )))
+            return Err(
+                Error::User(format!("SendResponse dropped before sending any response")).into_io(),
+            )
             .into();
         }
 
@@ -518,7 +526,11 @@ impl Bidirect {
     }
 
     #[instrument(skip(self, cx, io))]
-    fn poll_read_body<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<Result<(), Error>>
+    fn poll_read_body<S>(
+        &mut self,
+        cx: &mut Context,
+        io: &mut BufIo<S>,
+    ) -> Poll<Result<(), io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -556,6 +568,18 @@ impl Bidirect {
 
             tx_body.send(Ok(chunk.into_vec()));
         } else {
+            if !self.limit.is_complete() {
+                // https://tools.ietf.org/html/rfc7230#page-32
+                // If the sender closes the connection or
+                // the recipient times out before the indicated number of octets are
+                // received, the recipient MUST consider the message to be
+                // incomplete and close the connection.
+
+                trace!("Close because read body is not complete");
+                const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
+                return Err(io::Error::new(EOF, "Partial body")).into();
+            }
+
             // Remove tx_body Sender which indicates to the RecvStream that there is
             // no more body chunks to come.
             self.tx_body.take();
@@ -578,7 +602,7 @@ impl BodySender {
         cx: &mut Context,
         io: &mut BufIo<S>,
         register_on_user_input: bool,
-    ) -> Poll<Result<State, Error>>
+    ) -> Poll<Result<State, io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -639,14 +663,14 @@ impl fmt::Debug for SendResponse {
 }
 
 pub(crate) trait DriveExternal: Send {
-    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), Error>>;
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
 }
 
 impl<S> DriveExternal for Arc<Mutex<Codec<S>>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         let inner = self.clone();
 
         let mut lock = self.lock().unwrap();

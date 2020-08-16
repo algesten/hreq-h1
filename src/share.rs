@@ -58,7 +58,7 @@ impl SendStream {
     }
 
     #[instrument(skip(self, cx))]
-    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         if let Some(drive_external) = &self.drive_external {
             drive_external.poll_drive_external(cx)
         } else {
@@ -163,7 +163,7 @@ impl RecvStream {
     }
 
     #[instrument(skip(self, cx))]
-    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         if let Some(drive_external) = &self.drive_external {
             drive_external.poll_drive_external(cx)
         } else {
@@ -230,7 +230,11 @@ impl AsyncRead for RecvStream {
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_body_data(cx, buf)
+        let this = self.get_mut();
+
+        ready!(this.poll_drive_server(cx))?;
+
+        Pin::new(this).poll_body_data(cx, buf)
     }
 }
 
