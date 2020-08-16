@@ -182,7 +182,7 @@ impl Future for ResponseFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        let res = ready!(Pin::new(&mut this.0).poll_recv(cx));
+        let res = ready!(Pin::new(&mut this.0).poll_recv(cx, true));
 
         if let Some(v) = res {
             // nested io::Error
@@ -323,16 +323,24 @@ where
     #[instrument(skip(self, cx))]
     fn poll_drive(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
+            // whether we have Poll::Pending on io.
+            let mut pending_io = false;
+
             // first try to write queued outgoing bytes until it is pending or empty,
-            while try_write(
+            match try_write(
                 cx,
                 &mut self.io,
                 &mut self.to_write,
                 &mut self.to_write_flush_after,
-            )? {}
+            ) {
+                Poll::Ready(v) => v?,
+                Poll::Pending => {
+                    pending_io = true;
+                }
+            }
 
             // then drive state forward
-            match ready!(self.drive_state(cx)) {
+            match ready!(self.drive_state(cx, &mut pending_io)) {
                 Ok(do_loop) => {
                     // drive_state() can signal whether we should continue looping.
                     // this is not the same asPoll::Pending. ending the loop means
@@ -359,7 +367,7 @@ where
         Ok(()).into()
     }
 
-    fn drive_state(&mut self, cx: &mut Context) -> Poll<io::Result<bool>> {
+    fn drive_state(&mut self, cx: &mut Context, pending_io: &mut bool) -> Poll<io::Result<bool>> {
         trace!("drive_state: {:?}", self.state);
 
         match &mut self.state {
@@ -370,7 +378,7 @@ where
 
             State::Waiting => {
                 // try get the next request.
-                let next = ready!(Pin::new(&mut self.req_rx).poll_recv(cx));
+                let next = ready!(Pin::new(&mut self.req_rx).poll_recv(cx, true));
 
                 if let Some(h) = next {
                     trace!("Waiting => SendReq");
@@ -420,46 +428,14 @@ where
 
                 let mut req_body_pending = false;
 
-                if !b.done_req_body {
-                    // Not done sending a request body. Try get a body chunk to send.
-                    match Pin::new(&mut b.handle.rx_body).poll_recv(cx) {
-                        Poll::Pending => {
-                            // Pending is ok, it means the SendBody has not sent any chunk.
-                            trace!("Read req_body: Pending");
-                            req_body_pending = true;
-                        }
-
-                        Poll::Ready(Some((mut chunk, end))) => {
-                            trace!("Read req_body len: {}, end: {}", chunk.len(), end);
-
-                            // Got a chunk to send
-                            if self.to_write.is_empty() {
-                                self.to_write = chunk;
-                            } else {
-                                self.to_write.append(&mut chunk);
-                            }
-                            self.to_write_flush_after = false;
-
-                            // Sender signalled end of stream
-                            if end {
-                                trace!("done_req_body (end): true");
-                                b.done_req_body = true;
-                            }
-
-                            // loop to try write body.
-                            return Ok(true).into();
-                        }
-
-                        Poll::Ready(None) => {
-                            // No more body chunks to be expected, SendBody was dropped.
-                            trace!("done_req_body (None): true");
-                            b.done_req_body = true;
-                        }
-                    }
-                }
-
                 if !b.done_response {
-                    let res = ready!(poll_for_crlfcrlf(cx, &mut self.io, try_parse_res))??;
+                    let res = match poll_for_crlfcrlf(cx, &mut self.io, try_parse_res) {
+                        Poll::Pending => {
+                            *pending_io = true;
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(v) => v??,
+                    };
 
                     // invariant: poll_for_crlfcrlf should provide a full header and
                     //            try_parse_res should not be able to get a partial response.
@@ -518,6 +494,44 @@ where
                     }
                 }
 
+                if !b.done_req_body {
+                    // Not done sending a request body. Try get a body chunk to send.
+                    match Pin::new(&mut b.handle.rx_body).poll_recv(cx, !*pending_io) {
+                        Poll::Pending => {
+                            // Pending is ok, it means the SendBody has not sent any chunk.
+                            trace!("Read req_body: Pending");
+                            req_body_pending = true;
+                        }
+
+                        Poll::Ready(Some((mut chunk, end))) => {
+                            trace!("Read req_body len: {}, end: {}", chunk.len(), end);
+
+                            // Got a chunk to send
+                            if self.to_write.is_empty() {
+                                self.to_write = chunk;
+                            } else {
+                                self.to_write.append(&mut chunk);
+                            }
+                            self.to_write_flush_after = false;
+
+                            // Sender signalled end of stream
+                            if end {
+                                trace!("done_req_body (end): true");
+                                b.done_req_body = true;
+                            }
+
+                            // loop to try write body.
+                            return Ok(true).into();
+                        }
+
+                        Poll::Ready(None) => {
+                            // No more body chunks to be expected, SendBody was dropped.
+                            trace!("done_req_body (None): true");
+                            b.done_req_body = true;
+                        }
+                    }
+                }
+
                 // only proceed out of this state if we have both finished sending a request
                 // body and received a response header.
                 if b.done_req_body && b.done_response {
@@ -568,7 +582,7 @@ where
             State::RecvBody(r) => {
                 if !r.recv_buf.is_empty() {
                     trace!("tx_body try send chunk");
-                    if !ready!(Pin::new(&r.tx_body).poll_ready(cx)) {
+                    if !ready!(Pin::new(&r.tx_body).poll_ready(cx, true)) {
                         // receiver of body chunks is dropped, that's ok.
                     }
 
@@ -591,7 +605,13 @@ where
 
                 // read self.io through the limiter to stop reading when we are
                 // in place for the next request.
-                let res = ready!(r.limit.poll_read(cx, &mut self.io, &mut read_into[..]));
+                let res = match r.limit.poll_read(cx, &mut self.io, &mut read_into[..]) {
+                    Poll::Pending => {
+                        *pending_io = true;
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(v) => v,
+                };
                 trace!("Read res_body: ({:?})", res);
                 let amount = res?;
 

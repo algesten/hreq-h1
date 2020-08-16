@@ -65,11 +65,7 @@ impl SendStream {
             return Err(Error::User("Body data is not expected".into())).into();
         }
 
-        if let Some(server_inner) = &this.server_inner {
-            server_inner.poll_drive_external(cx)?;
-        }
-
-        if !ready!(Pin::new(&this.tx_body).poll_ready(cx)) {
+        if !ready!(Pin::new(&this.tx_body).poll_ready(cx, true)) {
             return Err(
                 io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed").into(),
             )
@@ -96,11 +92,11 @@ impl SendStream {
         Ok(()).into()
     }
 
-    fn poll_drive(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+    fn poll_drive_server(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
 
         if let Some(server_inner) = &this.server_inner {
-            server_inner.poll_drive_external(cx)?;
+            ready!(server_inner.poll_drive_external(cx))?;
         }
 
         Ok(()).into()
@@ -118,8 +114,9 @@ impl SendStream {
     #[instrument(skip(self, data, end_of_body))]
     pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
+        poll_fn(|cx| Pin::new(&mut *self).poll_drive_server(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_drive(cx)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_drive_server(cx)).await?;
         Ok(())
     }
 }
@@ -158,7 +155,7 @@ impl RecvStream {
     #[doc(hidden)]
     /// Poll for some body data.
     #[instrument(skip(self, cx, buf))]
-    pub fn poll_body_data(
+    fn poll_body_data(
         self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
@@ -167,7 +164,7 @@ impl RecvStream {
 
         // must drive the connection if server.
         if let Some(server_inner) = &this.server_inner {
-            server_inner.poll_drive_external(cx)?;
+            ready!(server_inner.poll_drive_external(cx))?;
         }
 
         if this.ended {
@@ -195,7 +192,7 @@ impl RecvStream {
             // invariant: Should be no ready bytes if we're here.
             assert!(this.ready.is_none());
 
-            match ready!(Pin::new(&mut this.rx_body).poll_recv(cx)) {
+            match ready!(Pin::new(&mut this.rx_body).poll_recv(cx, true)) {
                 None => {
                     // Channel is closed which indicates end of body.
                     this.ended = true;

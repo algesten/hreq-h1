@@ -25,12 +25,12 @@ impl<T> Receiver<T> {
         (Sender { inner: weak }, Receiver { inner })
     }
 
-    pub fn poll_recv(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<T>> {
+    pub fn poll_recv(self: Pin<&mut Self>, cx: &mut Context, register: bool) -> Poll<Option<T>> {
         let this = self.get_mut();
 
         let mut lock = this.inner.lock().unwrap();
 
-        match lock.poll_dequeue(cx) {
+        match lock.poll_dequeue(cx, register) {
             Poll::Pending => {
                 if Arc::weak_count(&this.inner) == 0 {
                     // no more senders around
@@ -58,12 +58,12 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub fn poll_ready(self: Pin<&Self>, cx: &mut Context) -> Poll<bool> {
+    pub fn poll_ready(self: Pin<&Self>, cx: &mut Context, register: bool) -> Poll<bool> {
         let this = self.get_ref();
 
         if let Some(inner) = this.inner.upgrade() {
             let mut lock = inner.lock().unwrap();
-            lock.poll_ready(cx)
+            lock.poll_ready(cx, register)
         } else {
             false.into()
         }
@@ -115,9 +115,11 @@ impl<T> Inner<T> {
         }
     }
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<bool> {
+    fn poll_ready(&mut self, cx: &mut Context, register: bool) -> Poll<bool> {
         if self.queue.len() >= self.bound {
-            self.wakers.push(cx.waker().clone());
+            if register {
+                self.wakers.push(cx.waker().clone());
+            }
             Poll::Pending
         } else {
             true.into()
@@ -129,12 +131,14 @@ impl<T> Inner<T> {
         self.wake_all();
     }
 
-    fn poll_dequeue(&mut self, cx: &mut Context) -> Poll<Option<T>> {
+    fn poll_dequeue(&mut self, cx: &mut Context, register: bool) -> Poll<Option<T>> {
         if let Some(t) = self.queue.pop_front() {
             self.wake_all();
             Some(t).into()
         } else {
-            self.wakers.push(cx.waker().clone());
+            if register {
+                self.wakers.push(cx.waker().clone());
+            }
             Poll::Pending
         }
     }

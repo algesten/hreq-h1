@@ -108,7 +108,7 @@ where
 
         let mut lock = this.0.lock().unwrap();
 
-        lock.poll_drive(cx, true, inner, true)
+        lock.poll_drive(cx, true, inner, true, true)
     }
 
     /// Accept a new incoming request to handle. One must accept new requests continuously
@@ -130,7 +130,7 @@ where
         let mut codec = self.0.lock().unwrap();
 
         // It doesn't matter what the return value is, we just need it to not be pending.
-        ready!(codec.poll_drive(cx, true, inner.clone(), false));
+        ready!(codec.poll_drive(cx, true, inner.clone(), false, false));
 
         ().into()
     }
@@ -262,17 +262,36 @@ impl Codec {
         want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
         pending_on_waiting: bool,
+        pending_on_non_io: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), Error>>> {
         loop {
+            // whether we have Poll::Pending on io.
+            let mut pending_io = false;
+
             // try write any bytes ready to be sent.
-            while try_write(
+            match try_write(
                 cx,
                 &mut self.io,
                 &mut self.to_write,
                 &mut self.to_write_flush_after,
-            )? {}
+            ) {
+                Poll::Ready(v) => v?,
+                Poll::Pending => {
+                    pending_io = true;
+                }
+            }
 
-            let ret = ready!(self.drive_state(cx, want_next_req, inner.clone()))?;
+            let ret = match self.drive_state(cx, want_next_req, inner.clone(), &mut pending_io) {
+                Poll::Pending => {
+                    if pending_io || pending_on_non_io {
+                        return Poll::Pending;
+                    } else {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Ready(v) => v?,
+            };
+
             match ret {
                 DriveResult::Request(p) => {
                     return Poll::Ready(Some(Ok(p)));
@@ -302,6 +321,7 @@ impl Codec {
         cx: &mut Context,
         want_next_req: bool,
         inner: Arc<Mutex<Codec>>,
+        pending_io: &mut bool,
     ) -> Poll<Result<DriveResult, io::Error>> {
         trace!("drive_state: {:?}", self.state);
 
@@ -320,8 +340,12 @@ impl Codec {
                     return Poll::Ready(Ok(DriveResult::Waiting));
                 }
 
-                match ready!(poll_for_crlfcrlf(cx, &mut self.io, try_parse_req)) {
-                    Ok(res) => {
+                match poll_for_crlfcrlf(cx, &mut self.io, try_parse_req) {
+                    Poll::Pending => {
+                        *pending_io = true;
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok(res)) => {
                         // unwrap error from failing to parse request header.
                         let req = res?;
 
@@ -332,7 +356,7 @@ impl Codec {
                         trace!("Waiting => RecvReq");
                         self.state = State::RecvReq(Some(req));
                     }
-                    Err(e) => {
+                    Poll::Ready(Err(e)) => {
                         if e.kind() == io::ErrorKind::UnexpectedEof {
                             trace!("Connection closed");
                         } else {
@@ -410,7 +434,7 @@ impl Codec {
                     if !self.read_buf.is_empty() {
                         if let Some(tx_body) = h.tx_body.as_mut() {
                             trace!("tx_body try send chunk");
-                            if !ready!(Pin::new(&*tx_body).poll_ready(cx)) {
+                            if !ready!(Pin::new(&*tx_body).poll_ready(cx, !*pending_io)) {
                                 // receiver of body chunks is dropped, that's ok.
                             }
 
@@ -439,6 +463,7 @@ impl Codec {
                         Poll::Pending => {
                             // Pending is ok, we can still make progress on sending the response.
                             trace!("Read req_body: Pending");
+                            *pending_io = true;
                             req_body_pending = true;
                         }
 
@@ -465,19 +490,20 @@ impl Codec {
                 }
 
                 if !h.done_response {
-                    let (res, end, rx_body) = match ready!(Pin::new(&mut h.rx_res).poll_recv(cx)) {
-                        Some((res, end, rx_body)) => (res, end, Some(rx_body)),
-                        None => {
-                            // SendResponse was dropped before any response was sent.
-                            // That's a fault, but we can save the connection! :)
-                            warn!("SendResponse dropped without sending a response");
-                            (
-                                http::Response::builder().status(500).body(()).unwrap(),
-                                true,
-                                None,
-                            )
-                        }
-                    };
+                    let (res, end, rx_body) =
+                        match ready!(Pin::new(&mut h.rx_res).poll_recv(cx, !*pending_io)) {
+                            Some((res, end, rx_body)) => (res, end, Some(rx_body)),
+                            None => {
+                                // SendResponse was dropped before any response was sent.
+                                // That's a fault, but we can save the connection! :)
+                                warn!("SendResponse dropped without sending a response");
+                                (
+                                    http::Response::builder().status(500).body(()).unwrap(),
+                                    true,
+                                    None,
+                                )
+                            }
+                        };
 
                     // got a response now.
                     trace!("done_response: true");
@@ -507,6 +533,9 @@ impl Codec {
                     }
 
                     h.holder = Some((end, limit, rx_body));
+
+                    // write this
+                    return Ok(DriveResult::Loop).into();
                 }
 
                 if h.done_req_body && h.done_response {
@@ -552,7 +581,8 @@ impl Codec {
                 // If there is a chunk to write, we will wait until it's written.
                 // Doing Poll::Pending here is deliberate. Before drive_state() we have
                 // made as much progress in try_write as possible.
-                if !self.to_write.is_empty() {
+                if *pending_io {
+                    trace!("Pending on io");
                     return Poll::Pending;
                 }
 
@@ -567,7 +597,7 @@ impl Codec {
                     return Ok(DriveResult::Loop).into();
                 }
 
-                let next = ready!(Pin::new(&mut b.rx_body).poll_recv(cx));
+                let next = ready!(Pin::new(&mut b.rx_body).poll_recv(cx, true));
 
                 if let Some((mut chunk, end)) = next {
                     trace!("Body data to send len={}, end={}", chunk.len(), end);
@@ -616,31 +646,27 @@ impl Codec {
 // ***************** Helper to drive connection externally *************************
 
 pub(crate) trait ServerDrive {
-    fn poll_drive_external(&self, cx: &mut Context) -> Result<(), io::Error>;
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
 }
 
 impl ServerDrive for Arc<Mutex<Codec>> {
-    fn poll_drive_external(&self, cx: &mut Context) -> Result<(), io::Error> {
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         let inner = self.clone();
 
         // this shouldn't really have any contention.
         let mut lock = self.lock().unwrap();
 
-        match lock.poll_drive(cx, false, inner, false) {
-            Poll::Pending => {
-                // this is ok, we have made max progress.const
-                Ok(())
-            }
-
-            Poll::Ready(Some(Err(e))) => Err(e.into_io()),
+        match lock.poll_drive(cx, false, inner, false, false) {
+            Poll::Pending => Poll::Pending,
 
             Poll::Ready(Some(Ok(_))) => {
                 // invariant: we must not receive the next request here.
                 unreachable!("Got next request in poll_drive_external")
             }
 
-            // this is what we want.
-            Poll::Ready(None) => Ok(()),
+            Poll::Ready(Some(Err(e))) => Err(e.into_io()).into(),
+
+            Poll::Ready(None) => Ok(()).into(),
         }
     }
 }
