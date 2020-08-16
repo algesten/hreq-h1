@@ -60,6 +60,7 @@
 
 use crate::buf_reader::BufReader;
 use crate::err_closed;
+use crate::fast_buf::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF_INIT_SIZE};
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
@@ -301,7 +302,7 @@ struct BodyReceiver {
     handle: Handle,
     limit: LimitRead,
     tx_body: Sender<io::Result<Vec<u8>>>,
-    recv_buf: Vec<u8>,
+    recv_buf: FastBuf,
     allow_reuse: bool,
 }
 
@@ -538,7 +539,7 @@ where
                             handle,
                             tx_body,
                             limit,
-                            recv_buf: Vec::with_capacity(READ_BUF_INIT_SIZE),
+                            recv_buf: FastBuf::with_capacity(READ_BUF_INIT_SIZE),
                             allow_reuse,
                         });
                     } else {
@@ -567,9 +568,11 @@ where
             State::RecvBody(r) => {
                 if !r.recv_buf.is_empty() {
                     trace!("tx_body try send chunk");
+                    if !ready!(Pin::new(&r.tx_body).poll_ready(cx)) {
+                        // receiver of body chunks is dropped, that's ok.
+                    }
 
-                    let chunk =
-                        mem::replace(&mut r.recv_buf, Vec::with_capacity(READ_BUF_INIT_SIZE));
+                    let chunk = r.recv_buf.take_vec();
 
                     // Since we poll_ready above, the error here is that the receiver is gone,
                     // which isn't a problem.
@@ -584,19 +587,24 @@ where
                 // invariant: if we're here, the recv_buffer must be empty.
                 assert!(r.recv_buf.is_empty());
 
-                // TODO: maybe increase this buffer size if it's fully used?
-                r.recv_buf.resize(READ_BUF_INIT_SIZE, 0);
+                let mut read_into = r.recv_buf.borrow();
 
                 // read self.io through the limiter to stop reading when we are
                 // in place for the next request.
-                let res = ready!(r.limit.poll_read(cx, &mut self.io, &mut r.recv_buf));
+                let res = ready!(r.limit.poll_read(cx, &mut self.io, &mut read_into[..]));
                 trace!("Read res_body: ({:?})", res);
                 let amount = res?;
 
                 if amount > 0 {
-                    // scale down buffer to read amount and loop to send off.
-                    r.recv_buf.resize(amount, 0);
+                    // commit additional len to buf
+                    read_into.add_len(amount);
+
+                    // loop
+                    return Ok(true).into();
                 } else {
+                    // scale buffer back.
+                    drop(read_into);
+
                     // ensure the limiter was complete, or drop the connection.
                     if !r.limit.is_complete() {
                         // https://tools.ietf.org/html/rfc7230#page-32
