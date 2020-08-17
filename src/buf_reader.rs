@@ -73,6 +73,7 @@ where
                     }
                     Poll::Ready(v) => {
                         trace!("poll_write: {:?}", v);
+                        this.pending_tx = false;
                         v?
                     }
                 };
@@ -91,13 +92,12 @@ where
                 }
                 Poll::Ready(v) => {
                     trace!("poll_write: {:?}", v);
+                    this.pending_tx = false;
                     v?
                 }
             }
             this.need_flush = false;
         }
-
-        this.pending_tx = false;
 
         Ok(()).into()
     }
@@ -324,6 +324,7 @@ where
             }
             r @ _ => {
                 trace!("poll_write: {:?}", r);
+                this.pending_tx = false;
                 r
             }
         }
@@ -343,6 +344,7 @@ where
             }
             r @ _ => {
                 trace!("poll_write: {:?}", r);
+                this.pending_tx = false;
                 r
             }
         }
@@ -362,6 +364,7 @@ where
             }
             r @ _ => {
                 trace!("poll_close: {:?}", r);
+                this.pending_tx = false;
                 r
             }
         }

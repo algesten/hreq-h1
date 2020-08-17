@@ -77,19 +77,25 @@ const MAX_RESPONSE_SIZE: usize = 8192;
 /// See [module level doc](index.html) for an example.
 pub fn handshake<S>(io: S) -> Connection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    Connection(Arc::new(Mutex::new(Codec::new(io))))
+    let inner = Arc::new(Mutex::new(Codec::new(io)));
+    let prod: Box<dyn DriveExternalProducer> = Box::new(MakeDriveExternal(inner.clone()));
+    let sprod = SyncDriveExternalProducer(prod);
+
+    Connection(inner, sprod)
 }
 
 /// Server connection for accepting incoming requests.
 ///
 /// See [module level doc](index.html) for an example.
-pub struct Connection<S>(Arc<Mutex<Codec<S>>>);
+pub struct Connection<S>(Arc<Mutex<Codec<S>>>, SyncDriveExternalProducer);
+
+struct WantNextReq(SyncDriveExternal, SyncDriveExternal);
 
 impl<S> Connection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     /// Accept a new incoming request to handle. One must accept new requests continuously
     /// to "drive" the connection forward, also for the already accepted requests.
@@ -113,21 +119,21 @@ where
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         let this = self.get_mut();
 
-        let inner = this.0.clone();
+        let d1 = this.1.make_drive_external();
+        let d2 = this.1.make_drive_external();
+        let want_next_req = WantNextReq(d1, d2);
 
         let mut lock = this.0.lock().unwrap();
 
-        lock.poll_server(cx, inner, true, true)
+        lock.poll_server(cx, Some(want_next_req), true)
     }
 
     #[instrument(skip(self, cx))]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        let inner = self.0.clone();
-
         let mut lock = self.0.lock().unwrap();
 
         // It doesn't matter what the return value is, we just need it to not be pending.
-        ready!(lock.poll_server(cx, inner, false, true));
+        ready!(lock.poll_server(cx, None, true));
 
         ().into()
     }
@@ -137,7 +143,7 @@ where
 ///
 /// See [module level doc](index.html) for an example.
 pub struct SendResponse {
-    drive_external: Box<dyn DriveExternal>,
+    drive_external: SyncDriveExternal,
     tx_res: Sender<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
 }
 
@@ -207,18 +213,17 @@ where
 
 impl<S> Codec<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    #[instrument(skip(self, cx, inner, want_next_req, register_on_user_input))]
+    #[instrument(skip(self, cx, want_next_req, register_on_user_input))]
     fn poll_server(
         &mut self,
         cx: &mut Context,
-        inner: Arc<Mutex<Codec<S>>>,
-        want_next_req: bool,
+        want_next_req: Option<WantNextReq>,
         register_on_user_input: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         // Any error bubbling up closes the connection.
-        match self.drive(cx, inner, want_next_req, register_on_user_input) {
+        match self.drive(cx, want_next_req, register_on_user_input) {
             Poll::Ready(Some(Err(e))) => {
                 debug!("Close on error: {:?}", e);
 
@@ -234,8 +239,7 @@ where
     fn drive(
         &mut self,
         cx: &mut Context,
-        inner: Arc<Mutex<Codec<S>>>,
-        want_next_req: bool,
+        want_next_req: Option<WantNextReq>,
         register_on_user_input: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         loop {
@@ -243,18 +247,18 @@ where
 
             match &mut self.state {
                 State::RecvReq(h) => {
-                    // poll_drive() called with the intention of just driving server state
-                    // and not to handle the next read request.
-                    if !want_next_req {
+                    if let Some(want_next_req) = want_next_req {
+                        let (next_req, next_state) =
+                            ready!(h.poll_next_req(cx, &mut self.io, want_next_req))?;
+
+                        trace!("RecvReq => {:?}", next_state);
+                        self.state = next_state;
+                        return Some(Ok(next_req)).into();
+                    } else {
+                        // poll_drive() called with the intention of just driving server state
+                        // and not to handle the next read request.
                         return None.into();
                     }
-
-                    let (next_req, next_state) = ready!(h.poll_next_req(cx, inner, &mut self.io))?;
-
-                    trace!("RecvReq => {:?}", next_state);
-                    self.state = next_state;
-
-                    return Some(Ok(next_req)).into();
                 }
                 State::SendRes(h) => {
                     let next_state =
@@ -307,15 +311,15 @@ impl fmt::Debug for State {
 struct RecvReq;
 
 impl RecvReq {
-    #[instrument(skip(self, cx, inner, io))]
+    #[instrument(skip(self, cx, io, want_next_req))]
     fn poll_next_req<S>(
         &mut self,
         cx: &mut Context,
-        inner: Arc<Mutex<Codec<S>>>,
         io: &mut BufIo<S>,
+        want_next_req: WantNextReq,
     ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), io::Error>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         let req = ready!(poll_for_crlfcrlf(cx, io, try_parse_req))??;
 
@@ -340,16 +344,16 @@ impl RecvReq {
 
         // Prepare the new "package" to be delivered out of the poll loop.
         let package = {
-            let drive_external1: Box<dyn DriveExternal> = Box::new(inner.clone());
-            let drive_external2: Box<dyn DriveExternal> = Box::new(inner);
+            //
+            let WantNextReq(d1, d2) = want_next_req;
 
-            let recv = RecvStream::new(rx_body, is_no_body, Some(drive_external1));
+            let recv = RecvStream::new(rx_body, is_no_body, Some(d1));
 
             let (parts, _) = req.into_parts();
             let req = http::Request::from_parts(parts, recv);
 
             let send = SendResponse {
-                drive_external: drive_external2,
+                drive_external: d2,
                 tx_res,
             };
 
@@ -579,7 +583,9 @@ impl Bidirect {
                 const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
                 return Err(io::Error::new(EOF, "Partial body")).into();
             }
+        }
 
+        if self.limit.is_complete() {
             // Remove tx_body Sender which indicates to the RecvStream that there is
             // no more body chunks to come.
             self.tx_body.take();
@@ -596,7 +602,7 @@ struct BodySender {
 }
 
 impl BodySender {
-    #[instrument(skip(self, cx, io))]
+    #[instrument(skip(self, cx, io, register_on_user_input))]
     fn poll_send_body<S>(
         &mut self,
         cx: &mut Context,
@@ -662,22 +668,59 @@ impl fmt::Debug for SendResponse {
     }
 }
 
-pub(crate) trait DriveExternal: Send {
+struct SyncDriveExternalProducer(Box<dyn DriveExternalProducer>);
+
+unsafe impl Send for SyncDriveExternalProducer {}
+unsafe impl Sync for SyncDriveExternalProducer {}
+
+impl DriveExternalProducer for SyncDriveExternalProducer {
+    fn make_drive_external(&self) -> SyncDriveExternal {
+        self.0.make_drive_external()
+    }
+}
+
+trait DriveExternalProducer {
+    fn make_drive_external(&self) -> SyncDriveExternal;
+}
+
+struct MakeDriveExternal<S>(Arc<Mutex<Codec<S>>>);
+
+impl<S> DriveExternalProducer for MakeDriveExternal<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    fn make_drive_external(&self) -> SyncDriveExternal {
+        let b: Box<dyn DriveExternal> = Box::new(self.0.clone());
+        SyncDriveExternal(b)
+    }
+}
+
+pub(crate) struct SyncDriveExternal(Box<dyn DriveExternal>);
+unsafe impl Send for SyncDriveExternal {}
+unsafe impl Sync for SyncDriveExternal {}
+
+impl DriveExternal for SyncDriveExternal {
+    fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+        self.0.poll_drive_external(cx)
+    }
+}
+
+pub(crate) trait DriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
 }
 
 impl<S> DriveExternal for Arc<Mutex<Codec<S>>>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-        let inner = self.clone();
-
         let mut lock = self.lock().unwrap();
 
-        match lock.poll_server(cx, inner, false, false) {
+        match lock.poll_server(cx, None, false) {
             Poll::Pending => {
-                let pending_io = lock.io.pending_rx() || lock.io.pending_rx();
+                let pending_io = lock.io.pending_rx() || lock.io.pending_tx();
+
+                trace!("pending_io: {}", pending_io);
 
                 // Only propagate Pending if it was due to io. We send register_on_user_input
                 // false, which means that reading user input from SendResponse and SendStream

@@ -1,6 +1,6 @@
 use crate::limit::LimitWrite;
 use crate::mpsc::{Receiver, Sender};
-use crate::server::DriveExternal;
+use crate::server::{DriveExternal, SyncDriveExternal};
 use crate::AsyncRead;
 use crate::Error;
 use futures_util::future::poll_fn;
@@ -20,7 +20,7 @@ pub struct SendStream {
     tx_body: Sender<(Vec<u8>, bool)>,
     limit: LimitWrite,
     ended: bool,
-    drive_external: Option<Box<dyn DriveExternal>>,
+    drive_external: Option<SyncDriveExternal>,
 }
 
 impl SendStream {
@@ -28,7 +28,7 @@ impl SendStream {
         tx_body: Sender<(Vec<u8>, bool)>,
         limit: LimitWrite,
         ended: bool,
-        drive_external: Option<Box<dyn DriveExternal>>,
+        drive_external: Option<SyncDriveExternal>,
     ) -> Self {
         SendStream {
             tx_body,
@@ -128,14 +128,14 @@ pub struct RecvStream {
     ready: Option<Vec<u8>>,
     index: usize,
     ended: bool,
-    drive_external: Option<Box<dyn DriveExternal>>,
+    drive_external: Option<SyncDriveExternal>,
 }
 
 impl RecvStream {
     pub(crate) fn new(
         rx_body: Receiver<io::Result<Vec<u8>>>,
         ended: bool,
-        drive_external: Option<Box<dyn DriveExternal>>,
+        drive_external: Option<SyncDriveExternal>,
     ) -> Self {
         RecvStream {
             rx_body,

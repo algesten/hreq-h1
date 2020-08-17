@@ -19,7 +19,12 @@ impl ConsumeBuf {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.buf.len() - self.pos
     }
 }
 

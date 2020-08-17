@@ -427,7 +427,9 @@ impl Bidirect {
                 }
             }
 
-            if res_tx_pending && body_tx_pending {
+            if res_tx_pending && (body_tx_pending || self.handle.body_rx.is_none())
+                || body_tx_pending && (res_tx_pending || self.handle.res_tx.is_none())
+            {
                 return Poll::Pending;
             }
         }
