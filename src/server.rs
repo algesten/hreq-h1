@@ -80,8 +80,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let inner = Arc::new(Mutex::new(Codec::new(io)));
-    let prod: Box<dyn DriveExternalProducer> = Box::new(MakeDriveExternal(inner.clone()));
-    let sprod = SyncDriveExternalProducer(prod);
+    let sprod = SyncDriveExternalProducer::new(inner.clone());
 
     Connection(inner, sprod)
 }
@@ -118,6 +117,9 @@ where
         cx: &mut Context,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         let this = self.get_mut();
+
+        // This will register on previous SyncDriveExternal being dropped.
+        ready!(this.1.poll_pending_external(cx));
 
         let d1 = this.1.make_drive_external();
         let d2 = this.1.make_drive_external();
@@ -668,22 +670,69 @@ impl fmt::Debug for SendResponse {
     }
 }
 
-struct SyncDriveExternalProducer(Box<dyn DriveExternalProducer>);
+struct SyncDriveExternalProducer {
+    boxed: Box<dyn DriveExternalProducer>,
+    recv: Receiver<()>,
+}
+
+impl SyncDriveExternalProducer {
+    fn new<S>(inner: Arc<Mutex<Codec<S>>>) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        let (send, recv) = Receiver::new(1);
+        SyncDriveExternalProducer {
+            boxed: Box::new(MakeDriveExternal(inner, send)),
+            recv,
+        }
+    }
+
+    // count_external() tells us how many Arc<Mutex<Codec<S>>> exists.
+    // When we are not actively handling a request, this is 2, one for
+    // Connection and one for (this) SyncDriveExternalProducer.
+    //
+    // When a Sender is dropped, it wakes the Receiver, and we use this
+    // as a mechanism to "monitor" when SyncDriveExternal instances are
+    // being dropped.
+    #[instrument(skip(self, cx))]
+    fn poll_pending_external(&mut self, cx: &mut Context) -> Poll<()> {
+        if self.count_external() == 2 {
+            trace!("poll_pending_external: Ready");
+            ().into()
+        } else {
+            match Pin::new(&mut self.recv).poll_recv(cx, true) {
+                Poll::Pending => {
+                    trace!("poll_pending_external Pending");
+                    return Poll::Pending;
+                }
+                Poll::Ready(_) => {
+                    // invariant: there is always a Sender in MakeDriveExternal, and they
+                    // never send anything.
+                    unreachable!()
+                }
+            }
+        }
+    }
+}
 
 unsafe impl Send for SyncDriveExternalProducer {}
 unsafe impl Sync for SyncDriveExternalProducer {}
 
 impl DriveExternalProducer for SyncDriveExternalProducer {
     fn make_drive_external(&self) -> SyncDriveExternal {
-        self.0.make_drive_external()
+        self.boxed.make_drive_external()
+    }
+    fn count_external(&self) -> usize {
+        self.boxed.count_external()
     }
 }
 
 trait DriveExternalProducer {
     fn make_drive_external(&self) -> SyncDriveExternal;
+    fn count_external(&self) -> usize;
 }
 
-struct MakeDriveExternal<S>(Arc<Mutex<Codec<S>>>);
+struct MakeDriveExternal<S>(Arc<Mutex<Codec<S>>>, Sender<()>);
 
 impl<S> DriveExternalProducer for MakeDriveExternal<S>
 where
@@ -691,11 +740,14 @@ where
 {
     fn make_drive_external(&self) -> SyncDriveExternal {
         let b: Box<dyn DriveExternal> = Box::new(self.0.clone());
-        SyncDriveExternal(b)
+        SyncDriveExternal(b, self.1.clone())
+    }
+    fn count_external(&self) -> usize {
+        Arc::strong_count(&self.0) + Arc::weak_count(&self.0)
     }
 }
 
-pub(crate) struct SyncDriveExternal(Box<dyn DriveExternal>);
+pub(crate) struct SyncDriveExternal(Box<dyn DriveExternal>, Sender<()>);
 unsafe impl Send for SyncDriveExternal {}
 unsafe impl Sync for SyncDriveExternal {}
 
