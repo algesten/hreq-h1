@@ -17,7 +17,7 @@ async fn server_request_200_ok() -> Result<(), Error> {
 
         assert_eq!(body.unwrap(), b"");
 
-        let body_send = respond.send_response(res, false).unwrap();
+        let body_send = respond.send_response(res, false).await.unwrap();
 
         common::send_body_chunks(body_send, b"OK", 1).await.unwrap();
 
@@ -54,7 +54,7 @@ async fn server_big_body_clen() -> Result<(), Error> {
 
         assert_eq!(body.unwrap(), b"");
 
-        let body_send = respond.send_response(res, false).unwrap();
+        let body_send = respond.send_response(res, false).await.unwrap();
 
         // 10 MB
         let big = vec![42_u8; 10 * 1024 * 1024];

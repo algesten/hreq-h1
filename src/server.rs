@@ -37,7 +37,7 @@
 //!
 //!                     // Send the response back to the client
 //!                     let mut send_body = respond
-//!                         .send_response(response, false).unwrap();
+//!                         .send_response(response, false).await.unwrap();
 //!
 //!                     send_body.send_data(b"Hello world!", true)
 //!                         .await.unwrap();
@@ -156,7 +156,7 @@ impl SendResponse {
     ///
     /// It's an error to send a body when the status or headers indicate there should not be one.
     #[instrument(skip(self, response, no_body))]
-    pub fn send_response(
+    pub async fn send_response(
         self,
         response: http::Response<()>,
         no_body: bool,
@@ -188,6 +188,8 @@ impl SendResponse {
         if !self.tx_res.send((response, ended, rx_body)) {
             Err(io::Error::new(io::ErrorKind::Other, "Connection closed"))?;
         }
+
+        poll_fn(|cx| self.drive_external.poll_drive_external(cx)).await?;
 
         Ok(send)
     }
@@ -748,10 +750,15 @@ impl DriveExternal for SyncDriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         self.0.poll_drive_external(cx)
     }
+
+    fn count_external(&self) -> usize {
+        self.0.count_external()
+    }
 }
 
 pub(crate) trait DriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
+    fn count_external(&self) -> usize;
 }
 
 impl<S> DriveExternal for Arc<Mutex<Codec<S>>>
@@ -785,5 +792,9 @@ where
             //
             Poll::Ready(None) => Ok(()).into(),
         }
+    }
+
+    fn count_external(&self) -> usize {
+        Arc::strong_count(&self) + Arc::weak_count(&self)
     }
 }
