@@ -409,6 +409,12 @@ impl Bidirect {
             let mut res_tx_pending = false;
             let mut body_tx_pending = false;
 
+            // The order of these two polls matter. We can only register one Waker
+            // for this poll. The incoming response might not come before we sent
+            // the entire request body. Sending the request body is also within the
+            // control of the user of the library. poll_send_body needs to be the
+            // latter of these two.
+
             if self.handle.res_tx.is_some() {
                 match self.poll_response(cx, io) {
                     Poll::Pending => {

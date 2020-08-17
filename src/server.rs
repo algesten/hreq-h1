@@ -90,8 +90,6 @@ where
 /// See [module level doc](index.html) for an example.
 pub struct Connection<S>(Arc<Mutex<Codec<S>>>, SyncDriveExternalProducer);
 
-struct WantNextReq(SyncDriveExternal, SyncDriveExternal);
-
 impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -121,13 +119,11 @@ where
         // This will register on previous SyncDriveExternal being dropped.
         ready!(this.1.poll_pending_external(cx));
 
-        let d1 = this.1.make_drive_external();
-        let d2 = this.1.make_drive_external();
-        let want_next_req = WantNextReq(d1, d2);
+        let drive_external = this.1.make_drive_external();
 
         let mut lock = this.0.lock().unwrap();
 
-        lock.poll_server(cx, Some(want_next_req), true)
+        lock.poll_server(cx, Some(drive_external), true)
     }
 
     #[instrument(skip(self, cx))]
@@ -185,7 +181,7 @@ impl SendResponse {
             || status == http::StatusCode::NO_CONTENT
             || status == http::StatusCode::NOT_MODIFIED;
 
-        let drive_external = Some(self.drive_external);
+        let drive_external = Some(self.drive_external.clone());
 
         let send = SendStream::new(tx_body, limit, ended, drive_external);
 
@@ -221,7 +217,7 @@ where
     fn poll_server(
         &mut self,
         cx: &mut Context,
-        want_next_req: Option<WantNextReq>,
+        want_next_req: Option<SyncDriveExternal>,
         register_on_user_input: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         // Any error bubbling up closes the connection.
@@ -241,7 +237,7 @@ where
     fn drive(
         &mut self,
         cx: &mut Context,
-        want_next_req: Option<WantNextReq>,
+        want_next_req: Option<SyncDriveExternal>,
         register_on_user_input: bool,
     ) -> Poll<Option<Result<(http::Request<RecvStream>, SendResponse), io::Error>>> {
         loop {
@@ -313,12 +309,12 @@ impl fmt::Debug for State {
 struct RecvReq;
 
 impl RecvReq {
-    #[instrument(skip(self, cx, io, want_next_req))]
+    #[instrument(skip(self, cx, io, drive_external))]
     fn poll_next_req<S>(
         &mut self,
         cx: &mut Context,
         io: &mut BufIo<S>,
-        want_next_req: WantNextReq,
+        drive_external: SyncDriveExternal,
     ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -347,15 +343,13 @@ impl RecvReq {
         // Prepare the new "package" to be delivered out of the poll loop.
         let package = {
             //
-            let WantNextReq(d1, d2) = want_next_req;
-
-            let recv = RecvStream::new(rx_body, is_no_body, Some(d1));
+            let recv = RecvStream::new(rx_body, is_no_body, Some(drive_external.clone()));
 
             let (parts, _) = req.into_parts();
             let req = http::Request::from_parts(parts, recv);
 
             let send = SendResponse {
-                drive_external: d2,
+                drive_external,
                 tx_res,
             };
 
@@ -426,9 +420,7 @@ impl Bidirect {
                     Poll::Pending => {
                         send_resp_pending = true;
                     }
-                    Poll::Ready(v) => {
-                        v?;
-                    }
+                    Poll::Ready(v) => v?,
                 }
             }
 
@@ -740,14 +732,15 @@ where
 {
     fn make_drive_external(&self) -> SyncDriveExternal {
         let b: Box<dyn DriveExternal> = Box::new(self.0.clone());
-        SyncDriveExternal(b, self.1.clone())
+        SyncDriveExternal(Arc::new(b), self.1.clone())
     }
     fn count_external(&self) -> usize {
         Arc::strong_count(&self.0) + Arc::weak_count(&self.0)
     }
 }
 
-pub(crate) struct SyncDriveExternal(Box<dyn DriveExternal>, Sender<()>);
+#[derive(Clone)]
+pub(crate) struct SyncDriveExternal(Arc<Box<dyn DriveExternal>>, Sender<()>);
 unsafe impl Send for SyncDriveExternal {}
 unsafe impl Sync for SyncDriveExternal {}
 
