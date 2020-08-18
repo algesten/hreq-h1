@@ -253,7 +253,12 @@ where
 
                         trace!("RecvReq => {:?}", next_state);
                         self.state = next_state;
-                        return Some(Ok(next_req)).into();
+
+                        if let Some(next_req) = next_req {
+                            return Some(Ok(next_req)).into();
+                        } else {
+                            return None.into();
+                        }
                     } else {
                         // poll_drive() called with the intention of just driving server state
                         // and not to handle the next read request.
@@ -317,11 +322,21 @@ impl RecvReq {
         cx: &mut Context,
         io: &mut BufIo<S>,
         drive_external: SyncDriveExternal,
-    ) -> Poll<Result<((http::Request<RecvStream>, SendResponse), State), io::Error>>
+    ) -> Poll<Result<(Option<(http::Request<RecvStream>, SendResponse)>, State), io::Error>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let req = ready!(poll_for_crlfcrlf(cx, io, try_parse_req))??;
+        let req = match ready!(poll_for_crlfcrlf(cx, io, try_parse_req)).and_then(|x| x) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    // remote just hung up before sending request, that's ok.
+                    return Ok((None, State::Closed)).into();
+                } else {
+                    return Err(e).into();
+                }
+            }
+        };
 
         // invariant: poll_for_crlfcrlf must have read a full request header.
         let req = req.expect("Didn't read full request");
@@ -373,7 +388,7 @@ impl RecvReq {
             holder: None,
         };
 
-        Ok((package, State::SendRes(bidirect))).into()
+        Ok((Some(package), State::SendRes(bidirect))).into()
     }
 }
 
