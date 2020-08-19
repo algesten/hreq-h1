@@ -465,11 +465,11 @@ impl Bidirect {
 
         let next_state = if no_body || limit.is_no_body() {
             if self.request_allows_reuse {
-                trace!("Request does not allow reuse");
-                State::Closed
-            } else {
                 trace!("No body to send");
                 State::RecvReq(RecvReq)
+            } else {
+                trace!("Request does not allow reuse");
+                State::Closed
             }
         } else {
             State::SendBody(BodySender {
@@ -646,11 +646,11 @@ impl BodySender {
 
                 if end {
                     let next_state = if self.request_allows_reuse {
-                        trace!("Request does not allow reuse");
-                        State::Closed
-                    } else {
                         trace!("Finished sending body");
                         State::RecvReq(RecvReq)
+                    } else {
+                        trace!("Request does not allow reuse");
+                        State::Closed
                     };
 
                     return Ok(next_state).into();
