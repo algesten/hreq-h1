@@ -338,7 +338,12 @@ impl RecvReq {
             }
         };
 
-        // invariant: poll_for_crlfcrlf must have read a full request header.
+        if req.is_none() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "Failed to parse request").into(),
+            )
+            .into();
+        }
         let req = req.expect("Didn't read full request");
 
         // Limiter to read the correct body amount from the socket.

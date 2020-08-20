@@ -213,7 +213,11 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error>
         http::Version::HTTP_10
     });
 
-    bld = bld.uri(uri.build().unwrap());
+    let uri = uri
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    bld = bld.uri(uri);
 
     if let Some(method) = parser.method {
         bld = bld.method(method);
