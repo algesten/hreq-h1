@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.3"
 async-std = { version = "1", features = ["attributes"] }
 futures-io = "0.3"
+http = "0.2"
 
 [dependencies.hreq-h1]
 path = ".."
@@ -30,5 +31,17 @@ doc = false
 [[bin]]
 name = "server_req"
 path = "fuzz_targets/server_req.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chunked_clen"
+path = "fuzz_targets/chunked_clen.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "server_chunk_clen"
+path = "fuzz_targets/server_chunk_clen.rs"
 test = false
 doc = false
