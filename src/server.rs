@@ -80,15 +80,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let inner = Arc::new(Mutex::new(Codec::new(io)));
-    let sprod = SyncDriveExternalProducer::new(inner.clone());
+    let (send, recv) = Receiver::new(1);
+    let drive = SyncDriveExternal(Arc::new(Box::new(inner.clone())), send);
 
-    Connection(inner, sprod)
+    Connection(inner, drive, recv)
 }
 
 /// Server connection for accepting incoming requests.
 ///
 /// See [module level doc](index.html) for an example.
-pub struct Connection<S>(Arc<Mutex<Codec<S>>>, SyncDriveExternalProducer);
+pub struct Connection<S>(Arc<Mutex<Codec<S>>>, SyncDriveExternal, Receiver<()>);
 
 impl<S> Connection<S>
 where
@@ -117,9 +118,9 @@ where
         let this = self.get_mut();
 
         // This will register on previous SyncDriveExternal being dropped.
-        ready!(this.1.poll_pending_external(cx));
+        ready!(this.1.poll_pending_external(cx, &mut this.2));
 
-        let drive_external = this.1.make_drive_external();
+        let drive_external = this.1.clone();
 
         let mut lock = this.0.lock().unwrap();
 
@@ -684,37 +685,42 @@ impl fmt::Debug for SendResponse {
     }
 }
 
-struct SyncDriveExternalProducer {
-    boxed: Box<dyn DriveExternalProducer>,
-    recv: Receiver<()>,
-}
+// These unsafe require some explanation. We want to be able to call Codec<S>::poll_drive
+// from both RecvStream and SendStream, however we don't want those two to be
+// generic over S. That leads us down the path of dynamic dispatch and "hiding"
+// S behind a Box<dyn DriveExternal>. So we implement that trait for Arc<Mutex<Codec<S>>>,
+// sorted... but oh not.
+//
+// If we put Box<dyn DriveExternal> as a property in SendStream, rust will later "discover"
+// this when it in an async context like async_std::spawn. Rust will say that DriveExternal
+// is not Sync/Send and if we try to constrain it, that will in turn propagate to S, and
+// we _don't_ want S to require Sync/Send.
+//
+// However. We always put S behind Arc<Mutex<Codec<S>>> and our treatment of S is
+// absolutely Sync/Send because of that mutex. That leads us to wrapping
+// Box<dyn DriveExternal> in some struct we can "unsafe impl Sync" for, and that's
+// SyncDriveExternal.
+unsafe impl Send for SyncDriveExternal {}
+unsafe impl Sync for SyncDriveExternal {}
 
-impl SyncDriveExternalProducer {
-    fn new<S>(inner: Arc<Mutex<Codec<S>>>) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Unpin + 'static,
-    {
-        let (send, recv) = Receiver::new(1);
-        SyncDriveExternalProducer {
-            boxed: Box::new(MakeDriveExternal(inner, send)),
-            recv,
-        }
-    }
+#[derive(Clone)]
+pub(crate) struct SyncDriveExternal(Arc<Box<dyn DriveExternal>>, Sender<()>);
 
+impl SyncDriveExternal {
     // count_external() tells us how many Arc<Mutex<Codec<S>>> exists.
     // When we are not actively handling a request, this is 2, one for
-    // Connection and one for (this) SyncDriveExternalProducer.
+    // Connection and one for (this) SyncDriveExternal.
     //
     // When a Sender is dropped, it wakes the Receiver, and we use this
     // as a mechanism to "monitor" when SyncDriveExternal instances are
     // being dropped.
-    #[instrument(skip(self, cx))]
-    fn poll_pending_external(&mut self, cx: &mut Context) -> Poll<()> {
+    #[instrument(skip(self, cx, recv))]
+    fn poll_pending_external(&mut self, cx: &mut Context, recv: &mut Receiver<()>) -> Poll<()> {
         if self.count_external() == 2 {
             trace!("poll_pending_external: Ready");
             ().into()
         } else {
-            match Pin::new(&mut self.recv).poll_recv(cx, true) {
+            match Pin::new(recv).poll_recv(cx, true) {
                 Poll::Pending => {
                     trace!("poll_pending_external Pending");
                     return Poll::Pending;
@@ -728,43 +734,6 @@ impl SyncDriveExternalProducer {
         }
     }
 }
-
-unsafe impl Send for SyncDriveExternalProducer {}
-unsafe impl Sync for SyncDriveExternalProducer {}
-
-impl DriveExternalProducer for SyncDriveExternalProducer {
-    fn make_drive_external(&self) -> SyncDriveExternal {
-        self.boxed.make_drive_external()
-    }
-    fn count_external(&self) -> usize {
-        self.boxed.count_external()
-    }
-}
-
-trait DriveExternalProducer {
-    fn make_drive_external(&self) -> SyncDriveExternal;
-    fn count_external(&self) -> usize;
-}
-
-struct MakeDriveExternal<S>(Arc<Mutex<Codec<S>>>, Sender<()>);
-
-impl<S> DriveExternalProducer for MakeDriveExternal<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    fn make_drive_external(&self) -> SyncDriveExternal {
-        let b: Box<dyn DriveExternal> = Box::new(self.0.clone());
-        SyncDriveExternal(Arc::new(b), self.1.clone())
-    }
-    fn count_external(&self) -> usize {
-        Arc::strong_count(&self.0) + Arc::weak_count(&self.0)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct SyncDriveExternal(Arc<Box<dyn DriveExternal>>, Sender<()>);
-unsafe impl Send for SyncDriveExternal {}
-unsafe impl Sync for SyncDriveExternal {}
 
 impl DriveExternal for SyncDriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
