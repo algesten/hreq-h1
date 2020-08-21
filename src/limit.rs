@@ -270,6 +270,22 @@ impl LimitWrite {
         }
     }
 
+    /// Tests if the encapsulated writer can accept an entire vec in one big write.
+    pub fn can_write_entire_vec(&self) -> bool {
+        if let LimitWrite::ContentLength(_) = self {
+            return true;
+        }
+        false
+    }
+
+    pub fn accept_entire_vec(&mut self, buf: &Vec<u8>) {
+        if let LimitWrite::ContentLength(v) = self {
+            v.total += buf.len() as u64;
+        } else {
+            panic!("accept_entire_vec with wrong type of writer");
+        }
+    }
+
     /// Write some data using this limiter.
     pub fn write(&mut self, data: &[u8], out: &mut FastBuf) -> Result<(), Error> {
         match self {

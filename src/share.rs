@@ -9,6 +9,7 @@ use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::fmt;
 use std::io;
+use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -52,9 +53,34 @@ impl SendStream {
     #[instrument(skip(self, data, end_of_body))]
     pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
+        let mut data = Data::Shared(data);
 
         poll_fn(|cx| self.poll_drive_server(cx)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, &mut data, end_of_body)).await?;
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+
+        Ok(())
+    }
+
+    /// Send one chunk of data. Use `end_of_body` to signal end of data.
+    ///
+    /// This is an optimization which together with a `content-length` shortcuts
+    /// some unnecessary copying of data.
+    ///
+    /// Alternate calls to this with calls to `ready` for flow control.
+    ///
+    /// When the body is constrained by a `content-length` header, this will only accept
+    /// the amount of bytes specified in the header. If there is too much data, the
+    /// function will error with a `Error::User`.
+    ///
+    /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
+    #[instrument(skip(self, data, end_of_body))]
+    pub async fn send_data_owned(&mut self, data: Vec<u8>, end_of_body: bool) -> Result<(), Error> {
+        trace!("Send len={} end_of_body={}", data.len(), end_of_body);
+        let mut data = Data::Owned(data);
+
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, &mut data, end_of_body)).await?;
         poll_fn(|cx| self.poll_drive_server(cx)).await?;
 
         Ok(())
@@ -77,7 +103,7 @@ impl SendStream {
     fn poll_send_data(
         self: Pin<&mut Self>,
         cx: &mut Context,
-        data: &[u8],
+        data: &mut Data,
         end: bool,
     ) -> Poll<Result<(), Error>> {
         let this = self.get_mut();
@@ -99,16 +125,33 @@ impl SendStream {
             .into();
         }
 
-        let capacity = data.len() + this.limit.overhead();
-        let mut chunk = FastBuf::with_capacity(capacity);
-        this.limit.write(data, &mut chunk)?;
+        let to_send = if data.is_owned() && this.limit.can_write_entire_vec() {
+            // This is an optmization when sending owned data. We can pass the
+            // Vec<u8> straight into the this.tx_body.send without copying the
+            // data into a FastBuf first.
 
-        if end {
-            this.ended = true;
-            this.limit.finish(&mut chunk)?;
-        }
+            let data = data.take_owned();
 
-        let sent = this.tx_body.send((chunk.into_vec(), end));
+            // so limit counters are correct
+            this.limit.accept_entire_vec(&data);
+
+            data
+        } else {
+            // This branch handles shared data as well as chunked body transfer.
+
+            let capacity = data.len() + this.limit.overhead();
+            let mut chunk = FastBuf::with_capacity(capacity);
+            this.limit.write(&data[..], &mut chunk)?;
+
+            if end {
+                this.ended = true;
+                this.limit.finish(&mut chunk)?;
+            }
+
+            chunk.into_vec()
+        };
+
+        let sent = this.tx_body.send((to_send, end));
 
         if !sent {
             return Err(
@@ -246,5 +289,56 @@ impl fmt::Debug for SendStream {
 impl fmt::Debug for RecvStream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RecvStream")
+    }
+}
+
+enum Data<'a> {
+    Shared(&'a [u8]),
+    Owned(Vec<u8>),
+    Empty,
+}
+
+impl<'a> Data<'a> {
+    fn is_owned(&self) -> bool {
+        if let Data::Owned(_) = self {
+            return true;
+        }
+        false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Data::Shared(v) => v.is_empty(),
+            Data::Owned(v) => v.is_empty(),
+            Data::Empty => true,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Data::Shared(v) => v.len(),
+            Data::Owned(v) => v.len(),
+            Data::Empty => 0,
+        }
+    }
+
+    pub fn take_owned(&mut self) -> Vec<u8> {
+        if self.is_owned() {
+            if let Data::Owned(v) = mem::replace(self, Data::Empty) {
+                return v;
+            }
+        }
+        panic!("Can't take_owned");
+    }
+}
+
+impl<'a> std::ops::Deref for Data<'a> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Data::Shared(v) => &v[..],
+            Data::Owned(v) => &v[..],
+            Data::Empty => panic!("Can't deref a Data::Empty"),
+        }
     }
 }

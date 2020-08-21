@@ -29,10 +29,10 @@ async fn throughput_server_to_client() -> Result<(), hreq_h1::Error> {
 
             let mut send_body = send_res.send_response(res, false).await.unwrap();
 
-            let chunk = vec![42_u8; PER_CHUNK];
-
             for _ in 0..CHUNKS {
-                send_body.send_data(&chunk[..], false).await.unwrap();
+                let chunk = vec![42_u8; PER_CHUNK];
+
+                send_body.send_data_owned(chunk, false).await.unwrap();
             }
             send_body.send_data(&[], true).await.unwrap();
         }
