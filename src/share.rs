@@ -43,21 +43,15 @@ impl SendStream {
 
     /// Send one chunk of data. Use `end_of_body` to signal end of data.
     ///
-    /// Alternate calls to this with calls to `ready` for flow control.
-    ///
     /// When the body is constrained by a `content-length` header, this will only accept
     /// the amount of bytes specified in the header. If there is too much data, the
     /// function will error with a `Error::User`.
     ///
     /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
-    #[instrument(skip(self, data, end_of_body))]
     pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
-        trace!("Send len={} end_of_body={}", data.len(), end_of_body);
-        let mut data = Data::Shared(data);
+        let data = Data::Shared(data);
 
-        poll_fn(|cx| self.poll_drive_server(cx)).await?;
-        poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, &mut data, end_of_body)).await?;
-        poll_fn(|cx| self.poll_drive_server(cx)).await?;
+        self.do_send(data, end_of_body).await?;
 
         Ok(())
     }
@@ -67,17 +61,22 @@ impl SendStream {
     /// This is an optimization which together with a `content-length` shortcuts
     /// some unnecessary copying of data.
     ///
-    /// Alternate calls to this with calls to `ready` for flow control.
-    ///
     /// When the body is constrained by a `content-length` header, this will only accept
     /// the amount of bytes specified in the header. If there is too much data, the
     /// function will error with a `Error::User`.
     ///
     /// For `transfer-encoding: chunked`, call to this function corresponds to one "chunk".
-    #[instrument(skip(self, data, end_of_body))]
     pub async fn send_data_owned(&mut self, data: Vec<u8>, end_of_body: bool) -> Result<(), Error> {
+        let data = Data::Owned(data);
+
+        self.do_send(data, end_of_body).await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, data, end_of_body))]
+    async fn do_send(&mut self, mut data: Data<'_>, end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
-        let mut data = Data::Owned(data);
 
         poll_fn(|cx| self.poll_drive_server(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, &mut data, end_of_body)).await?;
