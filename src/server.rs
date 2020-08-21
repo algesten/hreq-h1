@@ -707,16 +707,17 @@ unsafe impl Sync for SyncDriveExternal {}
 pub(crate) struct SyncDriveExternal(Arc<Box<dyn DriveExternal>>, Sender<()>);
 
 impl SyncDriveExternal {
-    // count_external() tells us how many Arc<Mutex<Codec<S>>> exists.
-    // When we are not actively handling a request, this is 2, one for
-    // Connection and one for (this) SyncDriveExternal.
+    // count_external() tells us how many Arc<Box<dyn DriveExternal>> exists.
+    // When we are not actively handling a request, this is 1.
     //
-    // When a Sender is dropped, it wakes the Receiver, and we use this
-    // as a mechanism to "monitor" when SyncDriveExternal instances are
-    // being dropped.
+    // When a Sender is dropped (inside the cloned Box<dyn DriveExternal> in RecvStream
+    // and SendStream), it wakes the Receiver, and we use this as a mechanism to "monitor"
+    // when SyncDriveExternal instances are being dropped.
     #[instrument(skip(self, cx, recv))]
     fn poll_pending_external(&mut self, cx: &mut Context, recv: &mut Receiver<()>) -> Poll<()> {
-        if self.count_external() == 2 {
+        let external = self.count_external();
+        trace!("poll_pending_external: {}", external);
+        if self.count_external() == 1 {
             trace!("poll_pending_external: Ready");
             ().into()
         } else {
@@ -733,21 +734,20 @@ impl SyncDriveExternal {
             }
         }
     }
+
+    fn count_external(&self) -> usize {
+        Arc::weak_count(&self.0) + Arc::strong_count(&self.0)
+    }
 }
 
 impl DriveExternal for SyncDriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         self.0.poll_drive_external(cx)
     }
-
-    fn count_external(&self) -> usize {
-        self.0.count_external()
-    }
 }
 
 pub(crate) trait DriveExternal {
     fn poll_drive_external(&self, cx: &mut Context) -> Poll<Result<(), io::Error>>;
-    fn count_external(&self) -> usize;
 }
 
 impl<S> DriveExternal for Arc<Mutex<Codec<S>>>
@@ -781,9 +781,5 @@ where
             //
             Poll::Ready(None) => Ok(()).into(),
         }
-    }
-
-    fn count_external(&self) -> usize {
-        Arc::strong_count(&self) + Arc::weak_count(&self)
     }
 }
