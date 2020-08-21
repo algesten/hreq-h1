@@ -2,6 +2,7 @@ use crate::fast_buf::{ConsumeBuf, FastBuf};
 use crate::{AsyncRead, AsyncWrite};
 use futures_util::ready;
 use std::io;
+use std::mem;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -36,6 +37,10 @@ where
             write_buf: None,
             need_flush: false,
         }
+    }
+
+    pub fn ensure_read_capacity(&mut self, capacity: usize) {
+        self.buf.ensure_capacity(capacity);
     }
 
     pub fn pending_tx(&self) -> bool {
@@ -227,6 +232,18 @@ where
         let buf = &this.buf[this.pos..];
 
         Ok(buf).into()
+    }
+
+    pub fn can_take_read_buf(&self) -> bool {
+        // can not take a partially read buf
+        self.pos == 0
+    }
+
+    pub fn take_read_buf(&mut self) -> Vec<u8> {
+        let replace = FastBuf::with_capacity(self.buf.capacity());
+        let buf = mem::replace(&mut self.buf, replace);
+        self.pos = 0;
+        buf.into_vec()
     }
 
     pub fn consume(self: Pin<&mut Self>, amount: usize) {

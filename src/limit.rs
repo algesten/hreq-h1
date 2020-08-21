@@ -111,6 +111,22 @@ impl LimitRead {
         false
     }
 
+    /// Tests if the encapsulated reader can accept an entire vec in one big read.
+    pub fn can_read_entire_vec(&self) -> bool {
+        if let ReadLimiter::ContentLength(_) = self.limiter {
+            return true;
+        }
+        false
+    }
+
+    pub fn accept_entire_vec(&mut self, buf: &Vec<u8>) {
+        if let ReadLimiter::ContentLength(v) = &mut self.limiter {
+            v.total += buf.len() as u64;
+        } else {
+            panic!("accept_entire_vec with wrong type of writer");
+        }
+    }
+
     /// Try read some data.
     pub fn poll_read<S: AsyncRead + Unpin>(
         &mut self,

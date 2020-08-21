@@ -44,6 +44,12 @@ impl FastBuf {
         FastBuf(Vec::with_capacity(capacity))
     }
 
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        if capacity > self.0.capacity() {
+            self.0.reserve(capacity - self.0.capacity())
+        }
+    }
+
     pub fn empty(&mut self) {
         unsafe {
             self.0.set_len(0);
@@ -56,6 +62,10 @@ impl FastBuf {
 
     pub fn into_vec(self) -> Vec<u8> {
         self.0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
     }
 
     pub fn borrow<'a>(&'a mut self) -> FastBufRef<'a> {

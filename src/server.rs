@@ -72,6 +72,9 @@ use std::task::{Context, Poll};
 /// Buffer size when writing a request.
 const MAX_RESPONSE_SIZE: usize = 8192;
 
+/// Max buffer size when reading a body.
+const MAX_BODY_READ_SIZE: u64 = 8 * 1024 * 1024;
+
 /// "handshake" to create a connection.
 ///
 /// See [module level doc](index.html) for an example.
@@ -386,12 +389,15 @@ impl RecvReq {
             Some(tx_body)
         };
 
+        let cur_read_size = limit.body_size().unwrap_or(8192).min(MAX_BODY_READ_SIZE) as usize;
+
         let bidirect = Bidirect {
             limit,
             request_allows_reuse,
             tx_body,
             rx_res: Some(rx_res),
             holder: None,
+            cur_read_size,
         };
 
         Ok((Some(package), State::SendRes(bidirect))).into()
@@ -411,6 +417,8 @@ struct Bidirect {
     rx_res: Option<Receiver<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>>,
     // Holder of data from rx_res used to receive/write a response body.
     holder: Option<(bool, LimitWrite, Receiver<(Vec<u8>, bool)>)>,
+    // The current read buffer size for receving the request body.
+    cur_read_size: usize,
 }
 
 impl Bidirect {
@@ -564,6 +572,8 @@ impl Bidirect {
             // the entire incoming body.
         }
 
+        io.ensure_read_capacity(self.cur_read_size);
+
         let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx, false))?;
 
         if buf.is_empty() {
@@ -577,17 +587,32 @@ impl Bidirect {
             .into();
         }
 
-        let mut chunk = FastBuf::with_capacity(buf.len());
+        let available_bytes = buf.len();
 
-        let mut read_into = chunk.borrow();
+        let chunk = if self.limit.can_read_entire_vec() && io.can_take_read_buf() {
+            let chunk = io.take_read_buf();
 
-        let amount = ready!(self.limit.poll_read(cx, io, &mut read_into[..]))?;
+            // To keep counting the size of the chunks
+            self.limit.accept_entire_vec(&chunk);
 
-        if amount > 0 {
-            // consume read_into to reset chunk size back to correct length as per FastBuf contract.
+            chunk
+        } else {
+            let mut chunk = FastBuf::with_capacity(available_bytes);
+
+            let mut read_into = chunk.borrow();
+
+            let amount = ready!(self.limit.poll_read(cx, io, &mut read_into[..]))?;
+
+            // consume read_into to reset chunk size back to correct length as per FastBuf contract.s
             read_into.add_len(amount);
 
-            tx_body.send(Ok(chunk.into_vec()));
+            chunk.into_vec()
+        };
+
+        trace!("Received body chunk len={}", chunk.len());
+
+        if chunk.len() > 0 {
+            tx_body.send(Ok(chunk));
         } else {
             if !self.limit.is_complete() {
                 // https://tools.ietf.org/html/rfc7230#page-32
