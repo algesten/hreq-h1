@@ -1,10 +1,10 @@
 use super::AsyncRead;
 use super::Error;
 use crate::buf_reader::BufIo;
+use crate::fast_buf::FastBuf;
 use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::io;
-use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -194,20 +194,39 @@ pub(crate) struct ChunkedEncoder;
 
 impl ChunkedEncoder {
     #[instrument(skip(out))]
-    pub fn write_chunk(buf: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut cur = io::Cursor::new(out);
+    pub fn write_chunk(buf: &[u8], out: &mut FastBuf) -> Result<(), Error> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let start = out.len();
+        let mut pos = out.len();
+        let mut into = out.borrow();
+
         let header = format!("{:x}\r\n", buf.len()).into_bytes();
-        cur.write_all(&header[..])?;
-        cur.write_all(&buf[..])?;
+        (&mut into[pos..(pos + header.len())]).copy_from_slice(&header[..]);
+        pos += header.len();
+
+        (&mut into[pos..(pos + buf.len())]).copy_from_slice(&buf[..]);
+        pos += buf.len();
+
         const CRLF: &[u8] = b"\r\n";
-        cur.write_all(CRLF)?;
+        (&mut into[pos..(pos + CRLF.len())]).copy_from_slice(&CRLF[..]);
+        pos += CRLF.len();
+
+        into.add_len(pos - start);
         Ok(())
     }
+
     #[instrument(skip(out))]
-    pub fn write_finish(out: &mut Vec<u8>) -> Result<(), Error> {
+    pub fn write_finish(out: &mut FastBuf) -> Result<(), Error> {
         const END: &[u8] = b"0\r\n\r\n";
-        let mut cur = io::Cursor::new(out);
-        cur.write_all(END)?;
+        let pos = out.len();
+
+        let mut into = out.borrow();
+        (&mut into[pos..(pos + END.len())]).copy_from_slice(&END[..]);
+
+        into.add_len(END.len());
         Ok(())
     }
 }

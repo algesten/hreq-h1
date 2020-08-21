@@ -1,3 +1,5 @@
+use crate::fast_buf::ConsumeBuf;
+use crate::fast_buf::FastBuf;
 use crate::limit::LimitWrite;
 use crate::mpsc::{Receiver, Sender};
 use crate::server::{DriveExternal, SyncDriveExternal};
@@ -97,7 +99,8 @@ impl SendStream {
             .into();
         }
 
-        let mut chunk = Vec::with_capacity(data.len() + this.limit.overhead());
+        let capacity = data.len() + this.limit.overhead();
+        let mut chunk = FastBuf::with_capacity(capacity);
         this.limit.write(data, &mut chunk)?;
 
         if end {
@@ -105,7 +108,7 @@ impl SendStream {
             this.limit.finish(&mut chunk)?;
         }
 
-        let sent = this.tx_body.send((chunk, end));
+        let sent = this.tx_body.send((chunk.into_vec(), end));
 
         if !sent {
             return Err(
@@ -126,8 +129,7 @@ impl SendStream {
 /// [`server::Connection`]: server/struct.Connection.html
 pub struct RecvStream {
     rx_body: Receiver<io::Result<Vec<u8>>>,
-    ready: Option<Vec<u8>>,
-    index: usize,
+    ready: Option<ConsumeBuf>,
     ended: bool,
     drive_external: Option<SyncDriveExternal>,
 }
@@ -141,7 +143,6 @@ impl RecvStream {
         RecvStream {
             rx_body,
             ready: None,
-            index: 0,
             ended,
             drive_external,
         }
@@ -152,7 +153,6 @@ impl RecvStream {
     /// Ends when returned size is `0`.
     #[instrument(skip(self, buf))]
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        poll_fn(|cx| self.poll_drive_server(cx)).await?;
         Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
     }
 
@@ -188,17 +188,14 @@ impl RecvStream {
 
         loop {
             // First ship out ready data already received.
-            if let Some(ready) = &this.ready {
-                let i = this.index;
+            if let Some(ready) = &mut this.ready {
+                let max = buf.len().min(ready.len());
+                (&mut buf[0..max]).copy_from_slice(&ready[..max]);
 
-                let max = buf.len().min(ready.len() - i);
+                ready.consume(max);
 
-                (&mut buf[0..max]).copy_from_slice(&ready[i..(i + max)]);
-                this.index += max;
-
-                if this.index == ready.len() {
-                    // all used up
-                    this.ready.take();
+                if ready.is_empty() {
+                    this.ready = None;
                 }
 
                 return Ok(max).into();
@@ -216,9 +213,7 @@ impl RecvStream {
                 Some(v) => {
                     // nested io::Error
                     let v = v?;
-
-                    this.ready = Some(v);
-                    this.index = 0;
+                    this.ready = Some(ConsumeBuf::new(v));
                 }
             }
         }
@@ -232,6 +227,9 @@ impl AsyncRead for RecvStream {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+
+        // can't poll data with an empty buffer
+        assert!(!buf.is_empty(), "poll_read with empty buf");
 
         ready!(this.poll_drive_server(cx))?;
 

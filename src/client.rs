@@ -78,6 +78,9 @@ use std::task::{Context, Poll};
 /// Buffer size when writing a request.
 const MAX_REQUEST_SIZE: usize = 8192;
 
+/// Max buffer size when reading a body.
+const MAX_BODY_READ_SIZE: u64 = 8 * 1024 * 1024;
+
 /// Creates a new HTTP/1 client backed by some async `io` connection.
 ///
 /// Returns a handle to send requests and a connection tuple. The connection
@@ -446,9 +449,12 @@ impl Bidirect {
         let next_state = if let Some(holder) = self.holder.take() {
             let (body_tx, limit) = holder;
 
+            let cur_read_size = limit.body_size().unwrap_or(8_192).min(MAX_BODY_READ_SIZE) as usize;
+
             let brec = BodyReceiver {
                 request_allows_reuse,
                 response_allows_reuse: self.response_allows_reuse,
+                cur_read_size,
                 limit,
                 body_tx,
             };
@@ -571,6 +577,7 @@ impl Bidirect {
 struct BodyReceiver {
     request_allows_reuse: bool,
     response_allows_reuse: bool,
+    cur_read_size: usize,
     limit: LimitRead,
     body_tx: Sender<io::Result<Vec<u8>>>,
 }
@@ -594,7 +601,7 @@ impl BodyReceiver {
                 // RecvStream is dropped, that's ok we will receive and drop entire body.
             }
 
-            let mut buf = FastBuf::with_capacity(MAX_REQUEST_SIZE);
+            let mut buf = FastBuf::with_capacity(self.cur_read_size);
 
             let mut read_into = buf.borrow();
 

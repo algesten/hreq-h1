@@ -1,4 +1,5 @@
 use crate::chunked::{ChunkedDecoder, ChunkedEncoder};
+use crate::fast_buf::FastBuf;
 use crate::AsyncRead;
 use crate::Error;
 use futures_util::ready;
@@ -90,6 +91,13 @@ impl LimitRead {
             ReadLimiter::ReadToEnd(v) => v.is_end(),
             ReadLimiter::NoBody => true,
         }
+    }
+
+    pub fn body_size(&self) -> Option<u64> {
+        if let ReadLimiter::ContentLength(v) = &self.limiter {
+            return Some(v.limit);
+        }
+        None
     }
 
     pub fn is_reusable(&self) -> bool {
@@ -263,7 +271,7 @@ impl LimitWrite {
     }
 
     /// Write some data using this limiter.
-    pub fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    pub fn write(&mut self, data: &[u8], out: &mut FastBuf) -> Result<(), Error> {
         match self {
             LimitWrite::ChunkedEncoder => ChunkedEncoder::write_chunk(data, out),
             LimitWrite::ContentLength(v) => v.write(data, out),
@@ -272,7 +280,7 @@ impl LimitWrite {
     }
 
     /// Finish up writing, called once after the all `write()` calls are done.
-    pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
+    pub fn finish(&mut self, out: &mut FastBuf) -> Result<(), Error> {
         match self {
             LimitWrite::ChunkedEncoder => ChunkedEncoder::write_finish(out),
             LimitWrite::ContentLength(_) => Ok(()),
@@ -293,8 +301,12 @@ impl ContentLengthWrite {
         ContentLengthWrite { limit, total: 0 }
     }
 
-    fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    fn write(&mut self, data: &[u8], out: &mut FastBuf) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
         self.total += data.len() as u64;
+
         if self.total > self.limit {
             let m = format!(
                 "Body data longer than content-length header: {} > {}",
@@ -302,9 +314,13 @@ impl ContentLengthWrite {
             );
             return Err(Error::User(m));
         }
-        let cur_len = out.len();
-        out.resize(cur_len + data.len(), 0);
-        (&mut out[cur_len..]).copy_from_slice(data);
+
+        let pos = out.len();
+        let mut into = out.borrow();
+
+        (&mut into[pos..(pos + data.len())]).copy_from_slice(data);
+
+        into.add_len(data.len());
         Ok(())
     }
 }
