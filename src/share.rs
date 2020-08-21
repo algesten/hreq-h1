@@ -51,6 +51,7 @@ impl SendStream {
     pub async fn send_data(&mut self, data: &[u8], end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
 
+        poll_fn(|cx| self.poll_drive_server(cx)).await?;
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, data, end_of_body)).await?;
         poll_fn(|cx| self.poll_drive_server(cx)).await?;
 
