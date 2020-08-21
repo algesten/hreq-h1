@@ -77,7 +77,10 @@ impl FastBuf {
             self.0.set_len(self.0.capacity());
         }
 
-        FastBufRef(&mut self.0, len_at_start)
+        FastBufRef {
+            buf: &mut self.0,
+            cur_len: len_at_start,
+        }
     }
 }
 
@@ -88,15 +91,30 @@ impl std::ops::Deref for FastBuf {
     }
 }
 
-pub(crate) struct FastBufRef<'a>(&'a mut Vec<u8>, usize);
+pub(crate) struct FastBufRef<'a> {
+    buf: &'a mut Vec<u8>,
+    cur_len: usize,
+}
 
 impl<'a> FastBufRef<'a> {
-    /// Add to length buffer is resized down to at drop.
-    ///
-    /// The called _must ensure_ there is data read into this amount of length.
-    pub fn add_len(mut self, amount: usize) {
-        self.1 += amount;
-        assert!(self.1 <= self.0.len());
+    /// Extend this buf from the slice. The
+    /// total length will be added to once the
+    /// FastBufRef is dropped.
+    pub fn extend_from_slice(&mut self, slice: &[u8]) {
+        assert!(
+            self.cur_len + slice.len() <= self.buf.len(),
+            "FastBuf::extend_from_slice not enough len"
+        );
+        (&mut self.buf[self.cur_len..(self.cur_len + slice.len())]).copy_from_slice(slice);
+        self.cur_len += slice.len();
+    }
+
+    pub fn add_len(mut self, len: usize) {
+        assert!(
+            self.cur_len + len <= self.buf.len(),
+            "FastBuf::add_len with not enough len"
+        );
+        self.cur_len += len;
     }
 }
 
@@ -105,7 +123,7 @@ impl<'a> Drop for FastBufRef<'a> {
     fn drop(&mut self) {
         // set length back when ref drops.
         unsafe {
-            self.0.set_len(self.1);
+            self.buf.set_len(self.cur_len);
         }
     }
 }
@@ -113,12 +131,12 @@ impl<'a> Drop for FastBufRef<'a> {
 impl<'a> std::ops::Deref for FastBufRef<'a> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        &(self.0)[..]
+        &(self.buf)[..]
     }
 }
 
 impl<'a> std::ops::DerefMut for FastBufRef<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut (self.0)[..]
+        &mut (self.buf)[..]
     }
 }

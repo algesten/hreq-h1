@@ -315,12 +315,10 @@ impl ContentLengthWrite {
             return Err(Error::User(m));
         }
 
-        let pos = out.len();
         let mut into = out.borrow();
 
-        (&mut into[pos..(pos + data.len())]).copy_from_slice(data);
+        into.extend_from_slice(data);
 
-        into.add_len(data.len());
         Ok(())
     }
 }

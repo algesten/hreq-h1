@@ -199,34 +199,26 @@ impl ChunkedEncoder {
             return Ok(());
         }
 
-        let start = out.len();
-        let mut pos = out.len();
         let mut into = out.borrow();
 
         let header = format!("{:x}\r\n", buf.len()).into_bytes();
-        (&mut into[pos..(pos + header.len())]).copy_from_slice(&header[..]);
-        pos += header.len();
+        into.extend_from_slice(&header[..]);
 
-        (&mut into[pos..(pos + buf.len())]).copy_from_slice(&buf[..]);
-        pos += buf.len();
+        into.extend_from_slice(&buf[..]);
 
         const CRLF: &[u8] = b"\r\n";
-        (&mut into[pos..(pos + CRLF.len())]).copy_from_slice(&CRLF[..]);
-        pos += CRLF.len();
+        into.extend_from_slice(&CRLF[..]);
 
-        into.add_len(pos - start);
         Ok(())
     }
 
     #[instrument(skip(out))]
     pub fn write_finish(out: &mut FastBuf) -> Result<(), Error> {
         const END: &[u8] = b"0\r\n\r\n";
-        let pos = out.len();
 
         let mut into = out.borrow();
-        (&mut into[pos..(pos + END.len())]).copy_from_slice(&END[..]);
+        into.extend_from_slice(&END[..]);
 
-        into.add_len(END.len());
         Ok(())
     }
 }
