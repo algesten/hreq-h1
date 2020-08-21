@@ -356,7 +356,7 @@ impl SendReq {
 
         let amount = write_http1x_req(&handle.req, &mut write_to)?;
 
-        write_to.add_len(amount);
+        write_to.extend(amount);
 
         // invariant: Can't have any pending bytes to write now.
         assert!(io.can_poll_write());
@@ -608,7 +608,7 @@ impl BodyReceiver {
             let amount = ready!(self.limit.poll_read(cx, io, &mut read_into))?;
 
             if amount > 0 {
-                read_into.add_len(amount);
+                read_into.extend(amount);
 
                 if !self.body_tx.send(Ok(buf.into_vec())) {
                     // RecvStream is dropped, that's ok we will receive and drop entire body.

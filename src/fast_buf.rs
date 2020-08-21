@@ -119,12 +119,12 @@ impl<'a> FastBufRef<'a> {
         self.cur_len += slice.len();
     }
 
-    pub fn add_len(mut self, len: usize) {
+    pub fn extend(mut self, amount: usize) {
         assert!(
-            self.cur_len + len <= self.buf.len(),
-            "FastBuf::add_len with not enough len"
+            self.cur_len + amount <= self.buf.len(),
+            "FastBuf::extend with not enough len"
         );
-        self.cur_len += len;
+        self.cur_len += amount;
     }
 }
 

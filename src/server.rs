@@ -75,6 +75,14 @@ const MAX_RESPONSE_SIZE: usize = 8192;
 /// Max buffer size when reading a body.
 const MAX_BODY_READ_SIZE: u64 = 8 * 1024 * 1024;
 
+// The state and I/O of the connection is driven by the async calls from the various entities
+// involved in accepting and responding to requests.
+//
+// 1. Connection::accept() drives while there is no current request.
+// 2. RecvStream::poll_read() and SendResponse::send_response() while reading a request body and
+//    responding to a request.
+// 3. SendStream::send_data() while a response body is being sent.
+
 /// "handshake" to create a connection.
 ///
 /// See [module level doc](index.html) for an example.
@@ -98,8 +106,7 @@ impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Accept a new incoming request to handle. One must accept new requests continuously
-    /// to "drive" the connection forward, also for the already accepted requests.
+    /// Accept a new incoming request to handle.
     pub async fn accept(
         &mut self,
     ) -> Option<Result<(http::Request<RecvStream>, SendResponse), Error>> {
@@ -108,7 +115,7 @@ where
             .map(|v| v.map_err(|x| x.into()))
     }
 
-    /// Wait until the connection has sent/flush all data and is ok to drop.
+    /// Wait until the connection has sent/flushed all data and is ok to drop.
     pub async fn close(mut self) {
         poll_fn(|cx| Pin::new(&mut self).poll_close(cx)).await;
     }
@@ -523,7 +530,7 @@ impl Bidirect {
 
             let amount = write_http1x_res(&res, &mut write_to[..])?;
 
-            write_to.add_len(amount);
+            write_to.extend(amount);
 
             let mut to_send = Some(&buf[..]);
 
@@ -590,6 +597,10 @@ impl Bidirect {
         let available_bytes = buf.len();
 
         let chunk = if self.limit.can_read_entire_vec() && io.can_take_read_buf() {
+            // This is an optimization. If we're using a content-length and not
+            // chunked, we can sometimes take the entire input buffer and therefore
+            // avoiding some data copying.
+
             let chunk = io.take_read_buf();
 
             // To keep counting the size of the chunks
@@ -604,7 +615,7 @@ impl Bidirect {
             let amount = ready!(self.limit.poll_read(cx, io, &mut read_into[..]))?;
 
             // consume read_into to reset chunk size back to correct length as per FastBuf contract.s
-            read_into.add_len(amount);
+            read_into.extend(amount);
 
             chunk.into_vec()
         };

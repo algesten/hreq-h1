@@ -224,7 +224,7 @@ where
                 Poll::Ready(Ok(amount)) => {
                     trace!("poll_read amount: {}", amount);
                     this.pending_rx = false;
-                    bref.add_len(amount);
+                    bref.extend(amount);
                 }
             }
         }
