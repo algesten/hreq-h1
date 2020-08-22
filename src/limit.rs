@@ -10,12 +10,7 @@ use std::str::FromStr;
 use std::task::{Context, Poll};
 
 /// Limit reading data given configuration from request headers.
-pub struct LimitRead {
-    limiter: ReadLimiter,
-    allow_reuse: bool,
-}
-
-enum ReadLimiter {
+pub(crate) enum LimitRead {
     /// Read from a chunked decoder. The decoder will know when there is no more
     /// data to be read.
     ChunkedDecoder(ChunkedDecoder),
@@ -35,7 +30,6 @@ impl LimitRead {
     /// 3. Otherwise consider there being no body.
     pub fn from_headers(
         headers: &http::HeaderMap<http::HeaderValue>,
-        version: http::Version,
         is_server_response: bool,
     ) -> Self {
         // NB: We're not enforcing 1.0 compliance. it's possible to mix
@@ -47,12 +41,12 @@ impl LimitRead {
         // Content-Length header field, the Transfer-Encoding overrides the
         // Content-Length.
 
-        let limiter = if is_chunked(headers) {
-            ReadLimiter::ChunkedDecoder(ChunkedDecoder::new())
+        let ret = if is_chunked(headers) {
+            LimitRead::ChunkedDecoder(ChunkedDecoder::new())
         } else if let Some(size) = get_as::<u64>(headers, "content-length") {
-            ReadLimiter::ContentLength(ContentLengthRead::new(size))
+            LimitRead::ContentLength(ContentLengthRead::new(size))
         } else {
-            if version == http::Version::HTTP_10 && is_server_response {
+            if is_server_response {
                 // https://tools.ietf.org/html/rfc1945#section-7.2.2
                 // When an Entity-Body is included with a message, the length of that
                 // body may be determined in one of two ways. If a Content-Length header
@@ -63,49 +57,48 @@ impl LimitRead {
                 // Closing the connection cannot be used to indicate the end of a
                 // request body, since it leaves no possibility for the server to send
                 // back a response.
-                ReadLimiter::ReadToEnd(ReadToEnd::new())
+                LimitRead::ReadToEnd(ReadToEnd::new())
             } else {
-                // no content-length, and no chunked, for 1.1 we don't expect a body.
-                ReadLimiter::NoBody
+                // For request, with content-length, and not chunked, for 1.1 we don't expect a body.
+                LimitRead::NoBody
             }
         };
 
-        LimitRead {
-            limiter,
-            allow_reuse: allow_reuse(headers, version),
-        }
+        trace!("LimitRead from headers: {:?}", ret);
+
+        ret
     }
 
     pub fn is_no_body(&self) -> bool {
-        match &self.limiter {
-            ReadLimiter::ContentLength(r) => r.limit == 0,
-            ReadLimiter::NoBody => true,
+        match &self {
+            LimitRead::ContentLength(r) => r.limit == 0,
+            LimitRead::NoBody => true,
             _ => false,
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        match &self.limiter {
-            ReadLimiter::ChunkedDecoder(v) => v.is_end(),
-            ReadLimiter::ContentLength(v) => v.is_end(),
-            ReadLimiter::ReadToEnd(v) => v.is_end(),
-            ReadLimiter::NoBody => true,
+        match &self {
+            LimitRead::ChunkedDecoder(v) => v.is_end(),
+            LimitRead::ContentLength(v) => v.is_end(),
+            LimitRead::ReadToEnd(v) => v.is_end(),
+            LimitRead::NoBody => true,
         }
     }
 
     pub fn body_size(&self) -> Option<u64> {
-        if let ReadLimiter::ContentLength(v) = &self.limiter {
+        if let LimitRead::ContentLength(v) = &self {
             return Some(v.limit);
         }
         None
     }
 
     pub fn is_reusable(&self) -> bool {
-        self.allow_reuse && self.is_complete() && !self.is_read_to_end()
+        self.is_complete() && !self.is_read_to_end()
     }
 
     fn is_read_to_end(&self) -> bool {
-        if let ReadLimiter::ReadToEnd(_) = self.limiter {
+        if let LimitRead::ReadToEnd(_) = self {
             return true;
         }
         false
@@ -113,14 +106,14 @@ impl LimitRead {
 
     /// Tests if the encapsulated reader can accept an entire vec in one big read.
     pub fn can_read_entire_vec(&self) -> bool {
-        if let ReadLimiter::ContentLength(_) = self.limiter {
+        if let LimitRead::ContentLength(_) = self {
             return true;
         }
         false
     }
 
     pub fn accept_entire_vec(&mut self, buf: &Vec<u8>) {
-        if let ReadLimiter::ContentLength(v) = &mut self.limiter {
+        if let LimitRead::ContentLength(v) = self {
             v.total += buf.len() as u64;
         } else {
             panic!("accept_entire_vec with wrong type of writer");
@@ -134,11 +127,11 @@ impl LimitRead {
         recv: &mut BufIo<S>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        match &mut self.limiter {
-            ReadLimiter::ChunkedDecoder(v) => v.poll_read(cx, recv, buf),
-            ReadLimiter::ContentLength(v) => v.poll_read(cx, recv, buf),
-            ReadLimiter::ReadToEnd(v) => v.poll_read(cx, recv, buf),
-            ReadLimiter::NoBody => Ok(0).into(),
+        match self {
+            LimitRead::ChunkedDecoder(v) => v.poll_read(cx, recv, buf),
+            LimitRead::ContentLength(v) => v.poll_read(cx, recv, buf),
+            LimitRead::ReadToEnd(v) => v.poll_read(cx, recv, buf),
+            LimitRead::NoBody => Ok(0).into(),
         }
     }
 }
@@ -201,7 +194,7 @@ impl ContentLengthRead {
     }
 }
 
-struct ReadToEnd {
+pub(crate) struct ReadToEnd {
     reached_end: bool,
 }
 
@@ -260,13 +253,17 @@ impl LimitWrite {
         // If a message is received with both a Transfer-Encoding and a
         // Content-Length header field, the Transfer-Encoding overrides the
         // Content-Length.
-        if is_chunked(headers) {
+        let ret = if is_chunked(headers) {
             LimitWrite::ChunkedEncoder
         } else if let Some(limit) = get_as::<u64>(headers, "content-length") {
             LimitWrite::ContentLength(ContentLengthWrite::new(limit))
         } else {
             LimitWrite::NoBody
-        }
+        };
+
+        trace!("LimitWrite from headers: {:?}", ret);
+
+        ret
     }
 
     /// Extra overhead bytes per send_data() call.
@@ -323,7 +320,7 @@ impl LimitWrite {
 
 /// Limit write by length.
 #[derive(Debug)]
-pub struct ContentLengthWrite {
+pub(crate) struct ContentLengthWrite {
     limit: u64,
     total: u64,
 }
@@ -357,11 +354,11 @@ impl ContentLengthWrite {
 
 impl fmt::Debug for LimitRead {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match &self.limiter {
-            ReadLimiter::ChunkedDecoder(_) => write!(f, "ChunkedDecoder")?,
-            ReadLimiter::ContentLength(l) => write!(f, "ContenLength({})", l.limit)?,
-            ReadLimiter::ReadToEnd(_) => write!(f, "ReadToEnd")?,
-            ReadLimiter::NoBody => write!(f, "NoBody")?,
+        match &self {
+            LimitRead::ChunkedDecoder(_) => write!(f, "ChunkedDecoder")?,
+            LimitRead::ContentLength(l) => write!(f, "ContenLength({})", l.limit)?,
+            LimitRead::ReadToEnd(_) => write!(f, "ReadToEnd")?,
+            LimitRead::NoBody => write!(f, "NoBody")?,
         }
         Ok(())
     }
@@ -382,7 +379,12 @@ fn is_chunked(headers: &http::HeaderMap<http::HeaderValue>) -> bool {
     headers
         .get("transfer-encoding")
         .and_then(|h| h.to_str().ok())
-        .map(|h| h.contains("chunked"))
+        // https://tools.ietf.org/html/rfc2616#section-4.4
+        //
+        // If a Transfer-Encoding header field (section 14.41) is present and
+        // has any value other than "identity", then the transfer-length is
+        // defined by use of the "chunked" transfer-coding
+        .map(|h| !h.contains("identity"))
         .unwrap_or(false)
 }
 

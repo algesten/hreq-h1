@@ -358,7 +358,7 @@ impl RecvReq {
         let req = req.expect("Didn't read full request");
 
         // Limiter to read the correct body amount from the socket.
-        let limit = LimitRead::from_headers(req.headers(), req.version(), false);
+        let limit = LimitRead::from_headers(req.headers(), false);
 
         let request_allows_reuse = allow_reuse(req.headers(), req.version());
 

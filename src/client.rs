@@ -486,7 +486,7 @@ impl Bidirect {
 
         self.response_allows_reuse = allow_reuse(res.headers(), res.version());
 
-        let limit = LimitRead::from_headers(res.headers(), res.version(), true);
+        let limit = LimitRead::from_headers(res.headers(), true);
 
         // https://tools.ietf.org/html/rfc7230#page-31
         // Any response to a HEAD request and any response with a 1xx
