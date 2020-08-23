@@ -356,7 +356,11 @@ impl SendReq {
 
         let amount = write_http1x_req(&handle.req, &mut write_to)?;
 
-        write_to.extend(amount);
+        // If write_http1x_req reports the correct number of bytes written to
+        // the buffer, this extend is correct.
+        unsafe {
+            write_to.extend(amount);
+        }
 
         // invariant: Can't have any pending bytes to write now.
         assert!(io.can_poll_write());
@@ -608,7 +612,10 @@ impl BodyReceiver {
             let amount = ready!(self.limit.poll_read(cx, io, &mut read_into))?;
 
             if amount > 0 {
-                read_into.extend(amount);
+                // If poll_read is correct, the buffer extend is safe.
+                unsafe {
+                    read_into.extend(amount);
+                }
 
                 if !self.body_tx.send(Ok(buf.into_vec())) {
                     // RecvStream is dropped, that's ok we will receive and drop entire body.

@@ -530,7 +530,11 @@ impl Bidirect {
 
             let amount = write_http1x_res(&res, &mut write_to[..])?;
 
-            write_to.extend(amount);
+            // If write_http1x_res reports the correct number of bytes written to
+            // the buffer, then this extend is safe.
+            unsafe {
+                write_to.extend(amount);
+            }
 
             let mut to_send = Some(&buf[..]);
 
@@ -614,8 +618,11 @@ impl Bidirect {
 
             let amount = ready!(self.limit.poll_read(cx, io, &mut read_into[..]))?;
 
-            // consume read_into to reset chunk size back to correct length as per FastBuf contract.s
-            read_into.extend(amount);
+            // If poll_read is reporting the correct amount of bytes read into buf,
+            // then this extend is safe.
+            unsafe {
+                read_into.extend(amount);
+            }
 
             chunk.into_vec()
         };

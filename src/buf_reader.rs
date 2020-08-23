@@ -224,7 +224,11 @@ where
                 Poll::Ready(Ok(amount)) => {
                     trace!("poll_read amount: {}", amount);
                     this.pending_rx = false;
-                    bref.extend(amount);
+                    // If poll_read is correct, we really have written amount bytes
+                    // into the buf and this is safe.
+                    unsafe {
+                        bref.extend(amount);
+                    }
                 }
             }
         }

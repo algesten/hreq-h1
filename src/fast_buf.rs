@@ -119,7 +119,10 @@ impl<'a> FastBufRef<'a> {
         self.cur_len += slice.len();
     }
 
-    pub fn extend(mut self, amount: usize) {
+    /// Tell this ref that we've written `amount` of bytes into it.
+    /// It's up to the call site to ensure the amount is really
+    /// written, or we'd have uninitilized memory being read later.
+    pub unsafe fn extend(mut self, amount: usize) {
         assert!(
             self.cur_len + amount <= self.buf.len(),
             "FastBuf::extend with not enough len"
