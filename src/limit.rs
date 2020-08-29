@@ -1,5 +1,6 @@
 use crate::chunked::{ChunkedDecoder, ChunkedEncoder};
 use crate::fast_buf::FastBuf;
+use crate::share::is_closed_kind;
 use crate::AsyncRead;
 use crate::Error;
 use futures_util::ready;
@@ -214,13 +215,28 @@ impl ReadToEnd {
     ) -> Poll<io::Result<usize>> {
         assert!(!buf.is_empty(), "poll_read with len 0 buf");
 
-        let amount = ready!(Pin::new(&mut *recv).poll_read(cx, buf))?;
-
-        if amount == 0 {
-            self.reached_end = true;
+        if self.reached_end {
+            return Ok(0).into();
         }
 
-        Ok(amount).into()
+        match ready!(Pin::new(&mut *recv).poll_read(cx, buf)) {
+            Ok(amount) => {
+                if amount == 0 {
+                    self.reached_end = true;
+                }
+
+                Ok(amount).into()
+            }
+            Err(e) => {
+                if is_closed_kind(e.kind()) {
+                    self.reached_end = true;
+
+                    Ok(0).into()
+                } else {
+                    Err(e).into()
+                }
+            }
+        }
     }
 }
 

@@ -57,6 +57,7 @@ use crate::http11::{poll_for_crlfcrlf, try_parse_req, write_http1x_res, READ_BUF
 use crate::limit::allow_reuse;
 use crate::limit::{LimitRead, LimitWrite};
 use crate::mpsc::{Receiver, Sender};
+use crate::share::is_closed_kind;
 use crate::Error;
 use crate::RecvStream;
 use crate::SendStream;
@@ -335,7 +336,7 @@ impl RecvReq {
         let req = match ready!(poll_for_crlfcrlf(cx, io, try_parse_req)).and_then(|x| x) {
             Ok(v) => v,
             Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
+                if is_closed_kind(e.kind()) {
                     // remote just hung up before sending request, that's ok.
                     return Ok((None, State::Closed)).into();
                 } else {

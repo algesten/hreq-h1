@@ -335,3 +335,10 @@ impl<'a> std::ops::Deref for Data<'a> {
         }
     }
 }
+
+/// Check if kind indicates the other side closed the connection.
+pub(crate) fn is_closed_kind(kind: io::ErrorKind) -> bool {
+    kind == io::ErrorKind::UnexpectedEof
+        || kind == io::ErrorKind::ConnectionReset
+        || kind == io::ErrorKind::ConnectionAborted
+}
