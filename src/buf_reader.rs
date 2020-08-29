@@ -56,7 +56,6 @@ impl<R> BufIo<R>
 where
     R: AsyncWrite + Unpin,
 {
-    #[instrument(skip(self, cx))]
     pub fn poll_finish_pending_write(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -116,7 +115,6 @@ where
     ///
     /// This poll_write variant write the entire buf to the underlying writer or nothing,
     /// potentially using an internal buffer for half written responses when hitting Pending.
-    #[instrument(skip(self, cx, buf, flush))]
     pub fn poll_write_all(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -193,7 +191,6 @@ impl<R> BufIo<R>
 where
     R: AsyncRead + Unpin,
 {
-    #[instrument(skip(self, cx, force_append))]
     pub fn poll_fill_buf(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -267,7 +264,6 @@ where
         }
     }
 
-    #[instrument(skip(self, cx, buf))]
     pub fn poll_read_buf(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -331,7 +327,6 @@ impl<R> AsyncWrite for BufIo<R>
 where
     R: AsyncWrite + Unpin,
 {
-    #[instrument(skip(self, cx, buf))]
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
@@ -351,7 +346,6 @@ where
         }
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
@@ -371,7 +365,6 @@ where
         }
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 

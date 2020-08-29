@@ -154,7 +154,6 @@ impl ContentLengthRead {
         self.total == self.limit
     }
 
-    #[instrument(skip(self, cx, recv, buf))]
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
@@ -207,7 +206,6 @@ impl ReadToEnd {
         self.reached_end
     }
 
-    #[instrument(skip(self, cx, recv, buf))]
     fn poll_read<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,

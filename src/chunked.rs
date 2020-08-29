@@ -46,7 +46,6 @@ impl ChunkedDecoder {
         Ok(poll_fn(|cx| self.poll_read(cx, recv, buf)).await?)
     }
 
-    #[instrument(skip(self, cx, recv, buf))]
     pub fn poll_read<S: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context,
@@ -193,7 +192,6 @@ impl ChunkedDecoder {
 pub(crate) struct ChunkedEncoder;
 
 impl ChunkedEncoder {
-    #[instrument(skip(out))]
     pub fn write_chunk(buf: &[u8], out: &mut FastBuf) -> Result<(), Error> {
         if buf.is_empty() {
             return Ok(());
@@ -212,7 +210,6 @@ impl ChunkedEncoder {
         Ok(())
     }
 
-    #[instrument(skip(out))]
     pub fn write_finish(out: &mut FastBuf) -> Result<(), Error> {
         const END: &[u8] = b"0\r\n\r\n";
 

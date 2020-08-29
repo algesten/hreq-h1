@@ -74,7 +74,6 @@ impl SendStream {
         Ok(())
     }
 
-    #[instrument(skip(self, data, end_of_body))]
     async fn do_send(&mut self, mut data: Data<'_>, end_of_body: bool) -> Result<(), Error> {
         trace!("Send len={} end_of_body={}", data.len(), end_of_body);
 
@@ -85,7 +84,6 @@ impl SendStream {
         Ok(())
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         if let Some(drive_external) = &self.drive_external {
             drive_external.poll_drive_external(cx)
@@ -98,7 +96,6 @@ impl SendStream {
     ///
     /// `end` controls whether this is the last body chunk to send. It's an error
     /// to send more data after `end` is `true`.
-    #[instrument(skip(self, cx, data, end))]
     fn poll_send_data(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -193,7 +190,6 @@ impl RecvStream {
     /// Read some body data into a given buffer.
     ///
     /// Ends when returned size is `0`.
-    #[instrument(skip(self, buf))]
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         Ok(poll_fn(move |cx| Pin::new(&mut *self).poll_read(cx, buf)).await?)
     }
@@ -205,7 +201,6 @@ impl RecvStream {
         self.ended
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_drive_server(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         if let Some(drive_external) = &self.drive_external {
             drive_external.poll_drive_external(cx)
@@ -216,7 +211,6 @@ impl RecvStream {
 
     #[doc(hidden)]
     /// Poll for some body data.
-    #[instrument(skip(self, cx, buf))]
     fn poll_body_data(
         self: Pin<&mut Self>,
         cx: &mut Context,

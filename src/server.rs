@@ -120,7 +120,6 @@ where
         poll_fn(|cx| Pin::new(&mut self).poll_close(cx)).await;
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_accept(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -137,7 +136,6 @@ where
         lock.poll_server(cx, Some(drive_external), true)
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let mut lock = self.0.lock().unwrap();
 
@@ -166,7 +164,6 @@ impl SendResponse {
     /// there will be no body to send.
     ///
     /// It's an error to send a body when the status or headers indicate there should not be one.
-    #[instrument(skip(self, response, no_body))]
     pub async fn send_response(
         self,
         response: http::Response<()>,
@@ -226,7 +223,6 @@ impl<S> Codec<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    #[instrument(skip(self, cx, want_next_req, register_on_user_input))]
     fn poll_server(
         &mut self,
         cx: &mut Context,
@@ -327,7 +323,6 @@ impl fmt::Debug for State {
 struct RecvReq;
 
 impl RecvReq {
-    #[instrument(skip(self, cx, io, drive_external))]
     fn poll_next_req<S>(
         &mut self,
         cx: &mut Context,
@@ -429,7 +424,6 @@ struct Bidirect {
 }
 
 impl Bidirect {
-    #[instrument(skip(self, cx, io, register_on_user_input))]
     fn poll_bidirect<S>(
         &mut self,
         cx: &mut Context,
@@ -502,7 +496,6 @@ impl Bidirect {
         Ok(next_state).into()
     }
 
-    #[instrument(skip(self, cx, io, register_on_user_input))]
     fn poll_send_resp<S>(
         &mut self,
         cx: &mut Context,
@@ -565,7 +558,6 @@ impl Bidirect {
         Ok(()).into()
     }
 
-    #[instrument(skip(self, cx, io))]
     fn poll_read_body<S>(
         &mut self,
         cx: &mut Context,
@@ -662,7 +654,6 @@ struct BodySender {
 }
 
 impl BodySender {
-    #[instrument(skip(self, cx, io, register_on_user_input))]
     fn poll_send_body<S>(
         &mut self,
         cx: &mut Context,
@@ -756,7 +747,6 @@ impl SyncDriveExternal {
     // When a Sender is dropped (inside the cloned Box<dyn DriveExternal> in RecvStream
     // and SendStream), it wakes the Receiver, and we use this as a mechanism to "monitor"
     // when SyncDriveExternal instances are being dropped.
-    #[instrument(skip(self, cx, recv))]
     fn poll_pending_external(&mut self, cx: &mut Context, recv: &mut Receiver<()>) -> Poll<()> {
         let external = self.count_external();
         trace!("poll_pending_external: {}", external);

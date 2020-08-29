@@ -122,7 +122,6 @@ impl SendRequest {
     /// will not accept data if `no_body` is true.
     ///
     /// Errors if the connection is closed.
-    #[instrument(skip(self, req, no_body))]
     pub fn send_request(
         &mut self,
         req: http::Request<()>,
@@ -267,7 +266,6 @@ where
         }
     }
 
-    #[instrument(skip(self, cx))]
     fn poll_client(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         // Any error bubbling up closes the connection.
         match self.drive(cx) {
@@ -333,7 +331,6 @@ where
 struct SendReq;
 
 impl SendReq {
-    #[instrument(skip(self, cx, io, req_rx))]
     fn poll_send_req<S>(
         &mut self,
         cx: &mut Context,
@@ -399,7 +396,6 @@ struct Bidirect {
 }
 
 impl Bidirect {
-    #[instrument(skip(self, cx, io))]
     fn poll_bidirect<S>(
         &mut self,
         cx: &mut Context,
@@ -477,7 +473,6 @@ impl Bidirect {
         Ok(next_state).into()
     }
 
-    #[instrument(skip(self, cx, io))]
     fn poll_response<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<io::Result<()>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -536,7 +531,6 @@ impl Bidirect {
         Ok(()).into()
     }
 
-    #[instrument(skip(self, cx, io))]
     fn poll_send_body<S>(&mut self, cx: &mut Context, io: &mut BufIo<S>) -> Poll<io::Result<()>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -587,7 +581,6 @@ struct BodyReceiver {
 }
 
 impl BodyReceiver {
-    #[instrument(skip(self, cx, io))]
     fn poll_read_body<S>(
         &mut self,
         cx: &mut Context,

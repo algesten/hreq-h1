@@ -172,7 +172,6 @@ where
     Ok(Connector(addr))
 }
 
-#[tracing::instrument(skip(io))]
 pub async fn test_read_header<S: AsyncRead + Unpin>(io: &mut BufIo<S>) -> Result<String, Error> {
     Ok(poll_fn(|cx| {
         hreq_h1::http11::poll_for_crlfcrlf(cx, io, |buf| String::from_utf8(buf.to_vec()).unwrap())
@@ -183,17 +182,19 @@ pub async fn test_read_header<S: AsyncRead + Unpin>(io: &mut BufIo<S>) -> Result
 pub fn setup_logger() {
     static START: Once = Once::new();
     START.call_once(|| {
-        use tracing::Level;
-        use tracing_subscriber::FmtSubscriber;
-
         let test_log = std::env::var("TEST_LOG")
             .map(|x| x != "0" && x.to_lowercase() != "false")
             .unwrap_or(false);
-        let level = if test_log { Level::TRACE } else { Level::INFO };
-
-        let sub = FmtSubscriber::builder().with_max_level(level).finish();
-
-        tracing::subscriber::set_global_default(sub).expect("tracing set_global_default");
+        let level = if test_log {
+            log::LevelFilter::Trace
+        } else {
+            log::LevelFilter::Info
+        };
+        pretty_env_logger::formatted_builder()
+            .filter_level(log::LevelFilter::Warn)
+            .filter_module("hreq_h1", level)
+            .target(env_logger::Target::Stdout)
+            .init();
     });
 }
 

@@ -1,5 +1,4 @@
 use async_std::net::{TcpListener, TcpStream};
-use tracing_futures::Instrument;
 
 mod common;
 
@@ -34,8 +33,7 @@ async fn throughput_server_to_client() -> Result<(), hreq_h1::Error> {
             send_body.send_data_owned(chunk, false).await.unwrap();
         }
         send_body.send_data(&[], true).await.unwrap();
-    }
-    .instrument(tracing::info_span!("server_task"));
+    };
 
     async_std::task::spawn(server);
 
@@ -125,8 +123,7 @@ async fn throughput_client_to_server() -> Result<(), hreq_h1::Error> {
         let mut send_body = send_res.send_response(res, false).await.unwrap();
 
         send_body.send_data(&[], true).await.unwrap();
-    }
-    .instrument(tracing::info_span!("server_task"));
+    };
 
     async_std::task::spawn(server);
 

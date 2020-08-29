@@ -5,8 +5,6 @@ use futures_util::io::AsyncWriteExt;
 use hreq_h1::buf_reader::BufIo;
 use hreq_h1::http11::poll_for_crlfcrlf;
 use hreq_h1::Error;
-use tracing::trace_span;
-use tracing_futures::Instrument;
 
 mod common;
 
@@ -32,8 +30,7 @@ async fn client_get_200_ok() -> Result<(), Error> {
         assert_eq!(req_s, "GET / HTTP/1.1\r\n\r\n");
 
         s_buf.write_all(b"HTTP/1.1 200 OK\r\n\r\nOK").await.unwrap();
-    }
-    .instrument(trace_span!("server_task"));
+    };
 
     async_std::task::spawn(server);
 

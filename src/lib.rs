@@ -53,7 +53,7 @@
 //! [`server::handshake`]: server/fn.handshake.html
 
 #[macro_use]
-extern crate tracing;
+extern crate log;
 
 mod error;
 mod fast_buf;

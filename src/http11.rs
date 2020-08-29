@@ -17,7 +17,6 @@ pub(crate) const READ_BUF_INIT_SIZE: usize = 16_384;
 
 /// Write an http/1.1 request to a buffer.
 #[allow(clippy::write_with_newline)]
-#[instrument(skip(req, buf))]
 pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
@@ -91,7 +90,6 @@ pub fn write_http1x_req(req: &http::Request<()>, buf: &mut [u8]) -> Result<usize
 
 /// Write an http/1.x response to a buffer.
 #[allow(clippy::write_with_newline)]
-#[instrument(skip(res, buf))]
 pub fn write_http1x_res(res: &http::Response<()>, buf: &mut [u8]) -> Result<usize, io::Error> {
     // Write http request into a buffer
     let mut w = io::Cursor::new(buf);
@@ -139,7 +137,6 @@ fn version_of(v: Option<u8>) -> http::Version {
 }
 
 /// Attempt to parse an http/1.1 response.
-#[instrument(skip(buf))]
 pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error> {
     trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
 
@@ -186,7 +183,6 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error
 }
 
 /// Attempt to parse an http/1.1 request.
-#[instrument(skip(buf))]
 pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error> {
     trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
 
@@ -251,7 +247,6 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error>
 /// Helper to poll for request or response.
 ///
 /// It looks out for \r\n\r\n, which indicates the end of the headers and body begins.
-#[instrument(skip(cx, io, f))]
 pub fn poll_for_crlfcrlf<S, F, T>(cx: &mut Context, io: &mut BufIo<S>, f: F) -> Poll<io::Result<T>>
 where
     S: AsyncRead + Unpin,
