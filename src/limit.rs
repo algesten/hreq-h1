@@ -137,6 +137,10 @@ impl LimitRead {
     }
 }
 
+pub(crate) fn headers_indicate_body(headers: &http::HeaderMap<http::HeaderValue>) -> bool {
+    is_chunked(headers) || get_as::<u64>(headers, "content-length").is_some()
+}
+
 use crate::buf_reader::BufIo;
 
 /// Reader limited by a set length.

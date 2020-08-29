@@ -62,7 +62,7 @@ use crate::buf_reader::BufIo;
 use crate::err_closed;
 use crate::fast_buf::FastBuf;
 use crate::http11::{poll_for_crlfcrlf, try_parse_res, write_http1x_req, READ_BUF_INIT_SIZE};
-use crate::limit::allow_reuse;
+use crate::limit::{allow_reuse, headers_indicate_body};
 use crate::limit::{LimitRead, LimitWrite};
 use crate::mpsc::{Receiver, Sender};
 use crate::Error;
@@ -498,7 +498,11 @@ impl Bidirect {
             || self.handle.req.method() == http::Method::HEAD
             || status.is_informational()
             || status == http::StatusCode::NO_CONTENT
-            || status == http::StatusCode::NOT_MODIFIED;
+            || status == http::StatusCode::NOT_MODIFIED
+            // 301/302 could have a body. If it does, we expect there to
+            // be some header indicating it. However if there aren't,
+            // we assume there is no body (instead of using ReadToEnd limiter)
+            || status.is_redirection() && !headers_indicate_body(res.headers());
 
         // TODO: handle CONNECT with a special state where connection becomes a tunnel
 
