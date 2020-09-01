@@ -153,6 +153,7 @@ where
 pub struct SendResponse {
     drive_external: SyncDriveExternal,
     tx_res: Sender<(http::Response<()>, bool, Receiver<(Vec<u8>, bool)>)>,
+    req_expects_no_body: bool,
 }
 
 impl SendResponse {
@@ -185,6 +186,7 @@ impl SendResponse {
         // empty line after the header fields, regardless of the header fields
         // present in the message, and thus cannot contain a message body.
         let ended = no_body
+            || self.req_expects_no_body
             || limit.is_no_body()
             || status.is_informational()
             || status == http::StatusCode::NO_CONTENT
@@ -358,11 +360,13 @@ impl RecvReq {
 
         let request_allows_reuse = allow_reuse(req.headers(), req.version());
 
+        let no_req_body = limit.is_no_body();
+
         // https://tools.ietf.org/html/rfc7230#page-31
         // Any response to a HEAD request ... is always terminated by the first
         // empty line after the header fields, regardless of the header fields
         // present in the message, and thus cannot contain a message body.
-        let is_no_body = limit.is_no_body() || req.method() == http::Method::HEAD;
+        let req_expects_no_body = req.method() == http::Method::HEAD;
 
         // bound channel to get backpressure
         let (tx_body, rx_body) = Receiver::new(1);
@@ -372,7 +376,7 @@ impl RecvReq {
         // Prepare the new "package" to be delivered out of the poll loop.
         let package = {
             //
-            let recv = RecvStream::new(rx_body, is_no_body, Some(drive_external.clone()));
+            let recv = RecvStream::new(rx_body, no_req_body, Some(drive_external.clone()));
 
             let (parts, _) = req.into_parts();
             let req = http::Request::from_parts(parts, recv);
@@ -380,6 +384,7 @@ impl RecvReq {
             let send = SendResponse {
                 drive_external,
                 tx_res,
+                req_expects_no_body,
             };
 
             (req, send)
