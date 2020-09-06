@@ -58,7 +58,6 @@ extern crate log;
 mod error;
 mod fast_buf;
 mod limit;
-mod mpsc;
 mod share;
 
 #[doc(hidden)]
@@ -69,6 +68,9 @@ pub mod http11;
 
 #[doc(hidden)]
 pub mod chunked;
+
+#[doc(hidden)]
+pub mod mpsc;
 
 pub(crate) use futures_io::{AsyncRead, AsyncWrite};
 
