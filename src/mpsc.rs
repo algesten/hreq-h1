@@ -1,10 +1,13 @@
+use futures_util::future::poll_fn;
 use std::collections::VecDeque;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
 /// Simple mpsc channel
-pub(crate) struct Receiver<T> {
+#[derive(Clone)]
+pub struct Receiver<T> {
     inner: Arc<Mutex<Inner<T>>>,
 }
 
@@ -25,8 +28,8 @@ impl<T> Receiver<T> {
         (Sender { inner: weak }, Receiver { inner })
     }
 
-    pub fn poll_recv(self: Pin<&mut Self>, cx: &mut Context, register: bool) -> Poll<Option<T>> {
-        let this = self.get_mut();
+    pub fn poll_recv(self: Pin<&Self>, cx: &mut Context, register: bool) -> Poll<Option<T>> {
+        let this = self.get_ref();
 
         let mut lock = this.inner.lock().unwrap();
 
@@ -43,9 +46,13 @@ impl<T> Receiver<T> {
             r @ _ => r,
         }
     }
+
+    pub async fn recv(&self) -> Option<T> {
+        poll_fn(|cx| Pin::new(&*self).poll_recv(cx, true)).await
+    }
 }
 
-pub(crate) struct Sender<T> {
+pub struct Sender<T> {
     inner: Weak<Mutex<Inner<T>>>,
 }
 
@@ -143,5 +150,17 @@ impl<T> Inner<T> {
         for w in self.wakers.drain(..) {
             w.wake();
         }
+    }
+}
+
+impl<T> fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Receiver")
+    }
+}
+
+impl<T> fmt::Debug for Sender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Sender")
     }
 }

@@ -240,7 +240,7 @@ impl RecvStream {
             // invariant: Should be no ready bytes if we're here.
             assert!(this.ready.is_none());
 
-            match ready!(Pin::new(&mut this.rx_body).poll_recv(cx, true)) {
+            match ready!(Pin::new(&this.rx_body).poll_recv(cx, true)) {
                 None => {
                     // Channel is closed which indicates end of body.
                     this.ended = true;

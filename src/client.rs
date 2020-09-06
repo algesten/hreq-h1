@@ -183,7 +183,7 @@ impl Future for ResponseFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        let res = ready!(Pin::new(&mut this.0).poll_recv(cx, true));
+        let res = ready!(Pin::new(&this.0).poll_recv(cx, true));
 
         if let Some(v) = res {
             // nested io::Error
@@ -291,7 +291,7 @@ where
 
             match &mut self.state {
                 State::SendReq(h) => {
-                    let next_state = ready!(h.poll_send_req(cx, &mut self.io, &mut self.req_rx))?;
+                    let next_state = ready!(h.poll_send_req(cx, &mut self.io, &self.req_rx))?;
 
                     if let Some(next_state) = next_state {
                         trace!("SendReq => {:?}", next_state);
@@ -335,7 +335,7 @@ impl SendReq {
         &mut self,
         cx: &mut Context,
         io: &mut BufIo<S>,
-        req_rx: &mut Receiver<Handle>,
+        req_rx: &Receiver<Handle>,
     ) -> Poll<io::Result<Option<State>>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -539,7 +539,7 @@ impl Bidirect {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let body_rx = self.handle.body_rx.as_mut().unwrap();
+        let body_rx = self.handle.body_rx.as_ref().unwrap();
 
         let (chunk, end) = match ready!(Pin::new(body_rx).poll_recv(cx, true)) {
             Some(v) => v,

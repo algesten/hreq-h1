@@ -128,7 +128,7 @@ where
         let this = self.get_mut();
 
         // This will register on previous SyncDriveExternal being dropped.
-        ready!(this.1.poll_pending_external(cx, &mut this.2));
+        ready!(this.1.poll_pending_external(cx, &this.2));
 
         let drive_external = this.1.clone();
 
@@ -512,7 +512,7 @@ impl Bidirect {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // We shouldn't be here unless we have rx_res.
-        let rx_res = self.rx_res.as_mut().unwrap();
+        let rx_res = self.rx_res.as_ref().unwrap();
 
         if let Some((res, end, rx_body)) =
             ready!(Pin::new(rx_res).poll_recv(cx, register_on_user_input))
@@ -673,7 +673,7 @@ impl BodySender {
         loop {
             // Always abort on Pending, but register_on_user_input controls whether this resulted in
             // any Waker being registered. This makes for flow control.
-            let next = ready!(Pin::new(&mut self.rx_body).poll_recv(cx, register_on_user_input));
+            let next = ready!(Pin::new(&self.rx_body).poll_recv(cx, register_on_user_input));
 
             // Pending writes must have been dealt with already at the beginning of poll_drive().
             assert!(io.can_poll_write());
@@ -753,7 +753,7 @@ impl SyncDriveExternal {
     // When a Sender is dropped (inside the cloned Box<dyn DriveExternal> in RecvStream
     // and SendStream), it wakes the Receiver, and we use this as a mechanism to "monitor"
     // when SyncDriveExternal instances are being dropped.
-    fn poll_pending_external(&mut self, cx: &mut Context, recv: &mut Receiver<()>) -> Poll<()> {
+    fn poll_pending_external(&mut self, cx: &mut Context, recv: &Receiver<()>) -> Poll<()> {
         let external = self.count_external();
         trace!("poll_pending_external: {}", external);
         if self.count_external() == 1 {
