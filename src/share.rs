@@ -9,6 +9,7 @@ use futures_util::future::poll_fn;
 use futures_util::ready;
 use std::fmt;
 use std::io;
+use std::io::Read;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -225,16 +226,15 @@ impl RecvStream {
         loop {
             // First ship out ready data already received.
             if let Some(ready) = &mut this.ready {
-                let max = buf.len().min(ready.len());
-                (&mut buf[0..max]).copy_from_slice(&ready[..max]);
+                let amt = (&ready[..]).read(buf)?;
 
-                ready.consume(max);
+                ready.consume(amt);
 
                 if ready.is_empty() {
                     this.ready = None;
                 }
 
-                return Ok(max).into();
+                return Ok(amt).into();
             }
 
             // invariant: Should be no ready bytes if we're here.

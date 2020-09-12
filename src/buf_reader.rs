@@ -2,6 +2,7 @@ use crate::fast_buf::{ConsumeBuf, FastBuf};
 use crate::{AsyncRead, AsyncWrite};
 use futures_util::ready;
 use std::io;
+use std::io::Read;
 use std::mem;
 use std::pin::Pin;
 use std::task::Context;
@@ -274,12 +275,11 @@ where
         let has_amount = this.buf.len() - this.pos;
 
         if has_amount > 0 {
-            let max = buf.len().min(has_amount);
-            trace!("poll_read_buf from buffer: {}", max);
+            let amt = (&this.buf[this.pos..]).read(buf)?;
 
-            (&mut buf[0..max]).copy_from_slice(&this.buf[this.pos..this.pos + max]);
+            trace!("poll_read_buf from buffer: {}", amt);
 
-            this.pos += max;
+            this.pos += amt;
 
             // reset if all is used up.
             if this.pos == this.buf.len() {
@@ -287,7 +287,7 @@ where
                 this.buf.empty();
             }
 
-            return Ok(max).into();
+            return Ok(amt).into();
         }
 
         // once inner buffer is used up, read directly from underlying.

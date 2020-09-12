@@ -115,7 +115,9 @@ impl<'a> FastBufRef<'a> {
             self.cur_len + slice.len() <= self.buf.len(),
             "FastBuf::extend_from_slice not enough len"
         );
+
         (&mut self.buf[self.cur_len..(self.cur_len + slice.len())]).copy_from_slice(slice);
+
         self.cur_len += slice.len();
     }
 
