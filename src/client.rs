@@ -155,7 +155,7 @@ impl SendRequest {
 
         if !self.req_tx.send(next) {
             // errors on full or closed, and since it's unbound...
-            return err_closed();
+            return err_closed("Can't enqueue request, connection is closed");
         }
 
         let fut = ResponseFuture(res_rx);
@@ -191,7 +191,7 @@ impl Future for ResponseFuture {
 
             Ok(v).into()
         } else {
-            err_closed().into()
+            err_closed("Response failed, connection is closed").into()
         }
     }
 }
@@ -259,6 +259,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn new(io: S, req_rx: Receiver<Handle>) -> Self {
+        trace!("=> SendReq");
         Codec {
             io: BufIo::with_capacity(READ_BUF_INIT_SIZE, io),
             state: State::SendReq(SendReq),

@@ -80,7 +80,7 @@ pub mod server;
 pub use error::Error;
 pub use share::{RecvStream, SendStream};
 
-pub(crate) fn err_closed<T>() -> Result<T, Error> {
+pub(crate) fn err_closed<T>(msg: &'static str) -> Result<T, Error> {
     use std::io;
-    Err(io::Error::new(io::ErrorKind::NotConnected, "Connection is closed").into())
+    Err(io::Error::new(io::ErrorKind::NotConnected, msg).into())
 }
