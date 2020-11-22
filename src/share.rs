@@ -82,6 +82,16 @@ impl SendStream {
         poll_fn(|cx| Pin::new(&mut *self).poll_send_data(cx, &mut data, end_of_body)).await?;
         poll_fn(|cx| self.poll_drive_server(cx)).await?;
 
+        // If content is ended, we effectively "flush", by keep doing poll_drive_external
+        // until we have driven all content through. This is only needed when we have
+        // drive_external (server side), since it means we are "driving" the connection
+        // from this very send action.
+        if self.ended && self.drive_external.is_some() {
+            while self.tx_body.len() > 0 {
+                poll_fn(|cx| self.poll_drive_server(cx)).await?;
+            }
+        }
+
         Ok(())
     }
 
