@@ -1,6 +1,6 @@
 [package]
 name = "hreq-h1"
-version = "0.3.8"
+version = "0.3.9"
 authors = ["Martin Algesten <martin@algesten.se>"]
 description = "Asynchronous HTTP/1.1 (and 1.0) implementation"
 license = "MIT/Apache-2.0"
