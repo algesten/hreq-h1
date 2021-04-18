@@ -213,6 +213,7 @@ where
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum State {
     /// Send next request.
     SendReq(SendReq),
@@ -282,7 +283,7 @@ where
 
                 Err(e).into()
             }
-            r @ _ => r,
+            r => r,
         }
     }
 
@@ -461,14 +462,12 @@ impl Bidirect {
             };
 
             Some(State::RecvBody(brec))
+        } else if request_allows_reuse && self.response_allows_reuse {
+            trace!("No response body, reuse connection");
+            Some(State::SendReq(SendReq))
         } else {
-            if request_allows_reuse && self.response_allows_reuse {
-                trace!("No response body, reuse connection");
-                Some(State::SendReq(SendReq))
-            } else {
-                trace!("No response body, reuse not allowed");
-                None
-            }
+            trace!("No response body, reuse not allowed");
+            None
         };
 
         Ok(next_state).into()

@@ -68,7 +68,7 @@ impl FastBuf {
         self.0.capacity()
     }
 
-    pub fn borrow<'a>(&'a mut self) -> FastBufRef<'a> {
+    pub fn borrow(&mut self) -> FastBufRef<'_> {
         assert!(self.0.capacity() > 0, "FastBuf::borrow() with 0 capacity");
         let len_at_start = self.0.len();
 

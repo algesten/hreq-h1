@@ -297,7 +297,7 @@ where
                 this.pending_rx = true;
                 Poll::Pending
             }
-            r @ _ => {
+            r => {
                 trace!("poll_read: {:?}", r);
                 this.pending_rx = false;
                 r
@@ -338,7 +338,7 @@ where
                 this.pending_tx = true;
                 Poll::Pending
             }
-            r @ _ => {
+            r => {
                 trace!("poll_write: {:?}", r);
                 this.pending_tx = false;
                 r
@@ -357,7 +357,7 @@ where
                 this.pending_tx = true;
                 Poll::Pending
             }
-            r @ _ => {
+            r => {
                 trace!("poll_write: {:?}", r);
                 this.pending_tx = false;
                 r
@@ -376,7 +376,7 @@ where
                 this.pending_tx = true;
                 Poll::Pending
             }
-            r @ _ => {
+            r => {
                 trace!("poll_close: {:?}", r);
                 this.pending_tx = false;
                 r

@@ -60,7 +60,7 @@ impl<T> Receiver<T> {
                 }
             }
 
-            r @ _ => r,
+            r => r,
         }
     }
 
@@ -112,6 +112,10 @@ impl<T> Sender<T> {
         } else {
             0
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

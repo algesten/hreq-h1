@@ -67,7 +67,7 @@ impl ChunkedDecoder {
                     trace!("Chunk size: {}", self.amount_left);
 
                     // reset for next time.
-                    self.chunk_size_buf.resize(0, 0);
+                    self.chunk_size_buf.clear();
 
                     if self.amount_left == 0 {
                         self.state = DecoderState::End;
@@ -202,10 +202,10 @@ impl ChunkedEncoder {
         let header = format!("{:x}\r\n", buf.len()).into_bytes();
         into.extend_from_slice(&header[..]);
 
-        into.extend_from_slice(&buf[..]);
+        into.extend_from_slice(&buf);
 
         const CRLF: &[u8] = b"\r\n";
-        into.extend_from_slice(&CRLF[..]);
+        into.extend_from_slice(&CRLF);
 
         Ok(())
     }
@@ -214,7 +214,7 @@ impl ChunkedEncoder {
         const END: &[u8] = b"0\r\n\r\n";
 
         let mut into = out.borrow();
-        into.extend_from_slice(&END[..]);
+        into.extend_from_slice(&END);
 
         Ok(())
     }

@@ -1,5 +1,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 #![warn(clippy::all)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::type_complexity)]
 
 //! An asynchronous HTTP/1 server and client implemenation.
 //!

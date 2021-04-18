@@ -87,7 +87,7 @@ impl SendStream {
         // drive_external (server side), since it means we are "driving" the connection
         // from this very send action.
         if self.ended && self.drive_external.is_some() {
-            while self.tx_body.len() > 0 {
+            while !self.tx_body.is_empty() {
                 poll_fn(|cx| self.poll_drive_server(cx)).await?;
             }
         }

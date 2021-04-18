@@ -197,7 +197,7 @@ impl SendResponse {
         let send = SendStream::new(tx_body, limit, ended, drive_external);
 
         if !self.tx_res.send((response, ended, rx_body)) {
-            Err(io::Error::new(io::ErrorKind::Other, "Connection closed"))?;
+            return Err(io::Error::new(io::ErrorKind::Other, "Connection closed").into());
         }
 
         poll_fn(|cx| self.drive_external.poll_drive_external(cx)).await?;
@@ -242,7 +242,7 @@ where
 
                 Some(Err(e)).into()
             }
-            r @ _ => r,
+            r => r,
         }
     }
 
@@ -348,9 +348,10 @@ impl RecvReq {
         };
 
         if req.is_none() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "Failed to parse request").into(),
-            )
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to parse request",
+            ))
             .into();
         }
         let req = req.expect("Didn't read full request");
@@ -555,9 +556,10 @@ impl Bidirect {
         } else {
             // The user dropped the SendResponse instance before sending a response.
             // This is a user fault.
-            return Err(
-                Error::User(format!("SendResponse dropped before sending any response")).into_io(),
+            return Err(Error::User(
+                "SendResponse dropped before sending any response".to_string(),
             )
+            .into_io())
             .into();
         }
 
@@ -591,8 +593,7 @@ impl Bidirect {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "EOF before complete body received",
-            )
-            .into())
+            ))
             .into();
         }
 
@@ -627,20 +628,18 @@ impl Bidirect {
 
         trace!("Received body chunk len={}", chunk.len());
 
-        if chunk.len() > 0 {
+        if !chunk.is_empty() {
             tx_body.send(Ok(chunk));
-        } else {
-            if !self.limit.is_complete() {
-                // https://tools.ietf.org/html/rfc7230#page-32
-                // If the sender closes the connection or
-                // the recipient times out before the indicated number of octets are
-                // received, the recipient MUST consider the message to be
-                // incomplete and close the connection.
+        } else if !self.limit.is_complete() {
+            // https://tools.ietf.org/html/rfc7230#page-32
+            // If the sender closes the connection or
+            // the recipient times out before the indicated number of octets are
+            // received, the recipient MUST consider the message to be
+            // incomplete and close the connection.
 
-                trace!("Close because read body is not complete");
-                const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
-                return Err(io::Error::new(EOF, "Partial body")).into();
-            }
+            trace!("Close because read body is not complete");
+            const EOF: io::ErrorKind = io::ErrorKind::UnexpectedEof;
+            return Err(io::Error::new(EOF, "Partial body")).into();
         }
 
         if self.limit.is_complete() {
@@ -706,8 +705,11 @@ impl BodySender {
                 // the SendStream was dropped.
                 warn!("SendStream dropped before sending end_of_body");
 
-                return Err(io::Error::new(io::ErrorKind::Other, "Unexpected end of body").into())
-                    .into();
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Unexpected end of body",
+                ))
+                .into();
             }
         }
     }
@@ -715,7 +717,7 @@ impl BodySender {
 
 impl<S> std::fmt::Debug for Connection<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", "Connection")
+        write!(f, "Connection")
     }
 }
 
@@ -763,7 +765,7 @@ impl SyncDriveExternal {
             match Pin::new(recv).poll_recv(cx, true) {
                 Poll::Pending => {
                     trace!("poll_pending_external Pending");
-                    return Poll::Pending;
+                    Poll::Pending
                 }
                 Poll::Ready(_) => {
                     // invariant: there is always a Sender in MakeDriveExternal, and they

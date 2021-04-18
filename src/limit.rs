@@ -46,23 +46,21 @@ impl LimitRead {
             LimitRead::ChunkedDecoder(ChunkedDecoder::new())
         } else if let Some(size) = get_as::<u64>(headers, "content-length") {
             LimitRead::ContentLength(ContentLengthRead::new(size))
-        } else {
-            if is_server_response {
-                // https://tools.ietf.org/html/rfc1945#section-7.2.2
-                // When an Entity-Body is included with a message, the length of that
-                // body may be determined in one of two ways. If a Content-Length header
-                // field is present, its value in bytes represents the length of the
-                // Entity-Body. Otherwise, the body length is determined by the closing
-                // of the connection by the server.
+        } else if is_server_response {
+            // https://tools.ietf.org/html/rfc1945#section-7.2.2
+            // When an Entity-Body is included with a message, the length of that
+            // body may be determined in one of two ways. If a Content-Length header
+            // field is present, its value in bytes represents the length of the
+            // Entity-Body. Otherwise, the body length is determined by the closing
+            // of the connection by the server.
 
-                // Closing the connection cannot be used to indicate the end of a
-                // request body, since it leaves no possibility for the server to send
-                // back a response.
-                LimitRead::ReadToEnd(ReadToEnd::new())
-            } else {
-                // For request, with content-length, and not chunked, for 1.1 we don't expect a body.
-                LimitRead::NoBody
-            }
+            // Closing the connection cannot be used to indicate the end of a
+            // request body, since it leaves no possibility for the server to send
+            // back a response.
+            LimitRead::ReadToEnd(ReadToEnd::new())
+        } else {
+            // For request, with content-length, and not chunked, for 1.1 we don't expect a body.
+            LimitRead::NoBody
         };
 
         trace!("LimitRead from headers: {:?}", ret);
@@ -113,7 +111,7 @@ impl LimitRead {
         false
     }
 
-    pub fn accept_entire_vec(&mut self, buf: &Vec<u8>) {
+    pub fn accept_entire_vec(&mut self, buf: &[u8]) {
         if let LimitRead::ContentLength(v) = self {
             v.total += buf.len() as u64;
         } else {
@@ -309,7 +307,7 @@ impl LimitWrite {
         false
     }
 
-    pub fn accept_entire_vec(&mut self, buf: &Vec<u8>) {
+    pub fn accept_entire_vec(&mut self, buf: &[u8]) {
         if let LimitWrite::ContentLength(v) = self {
             v.total += buf.len() as u64;
         } else {
