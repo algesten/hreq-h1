@@ -294,7 +294,7 @@ where
         let end_of_stream = buf.len() == buf_index;
 
         loop {
-            if end_index == END_OF_HEADER.len() || end_of_stream {
+            if end_index == END_OF_HEADER.len() || end_of_stream && buf_index > 0 {
                 // we might have found the end of the request/response header
 
                 // convert to whatever caller wants.
@@ -305,6 +305,14 @@ where
                 Pin::new(&mut *io).consume(buf_index);
 
                 return Ok(ret).into();
+            }
+
+            if end_of_stream && buf_index == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF and no header length".to_string(),
+                ))
+                .into();
             }
 
             if buf_index == READ_BUF_INIT_SIZE {
