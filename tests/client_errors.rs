@@ -41,11 +41,11 @@ async fn partial_response_header() -> Result<(), Error> {
 
     let req = http::Request::get("/path").body("").unwrap();
 
-    let err = common::run(conn.connect().await?, req)
+    let (parts, _) = common::run(conn.connect().await?, req)
         .await
-        .expect_err("partial response");
+        .expect("partial response");
 
-    assert_eq!(err.to_string(), "EOF before complete http11 header");
+    assert_eq!(parts.status, 200);
 
     Ok(())
 }
