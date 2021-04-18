@@ -132,12 +132,22 @@ fn version_of(v: Option<u8>) -> http::Version {
     match v {
         Some(0) => http::Version::HTTP_10,
         Some(1) => http::Version::HTTP_11,
-        _ => panic!("Unhandled http version: {:?}", v),
+        Some(v) => {
+            trace!("Unknown http version ({}), assume HTTP/1.1", v);
+            http::Version::HTTP_11
+        }
+        None => {
+            trace!("Found no http version, assume HTTP/1.1");
+            http::Version::HTTP_11
+        }
     }
 }
 
 /// Attempt to parse an http/1.1 response.
-pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error> {
+pub fn try_parse_res(
+    buf: &[u8],
+    end_of_stream: bool,
+) -> Result<Option<http::Response<()>>, io::Error> {
     trace!("try_parse_res: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -147,7 +157,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error
         .parse(&buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    if status.is_partial() {
+    if status.is_partial() && !end_of_stream {
         return Ok(None);
     }
 
@@ -158,8 +168,16 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error
     }
 
     for head in parser.headers.iter() {
+        if head.name.is_empty() && end_of_stream {
+            // ignore empty stuff if this parsing is due to end_of_stream.
+            // (it's probably broken).
+            trace!("Ignore empty header");
+            continue;
+        }
+
         let name = HeaderName::from_bytes(head.name.as_bytes());
         let value = HeaderValue::from_bytes(head.value);
+
         match (name, value) {
             (Ok(name), Ok(value)) => bld = bld.header(name, value),
             (Err(e), _) => {
@@ -183,7 +201,7 @@ pub fn try_parse_res(buf: &[u8]) -> Result<Option<http::Response<()>>, io::Error
 }
 
 /// Attempt to parse an http/1.1 request.
-pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error> {
+pub fn try_parse_req(buf: &[u8], _: bool) -> Result<Option<http::Request<()>>, io::Error> {
     trace!("try_parse_req: {:?}", String::from_utf8_lossy(buf));
 
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -250,7 +268,7 @@ pub fn try_parse_req(buf: &[u8]) -> Result<Option<http::Request<()>>, io::Error>
 pub fn poll_for_crlfcrlf<S, F, T>(cx: &mut Context, io: &mut BufIo<S>, f: F) -> Poll<io::Result<T>>
 where
     S: AsyncRead + Unpin,
-    F: FnOnce(&[u8]) -> T,
+    F: FnOnce(&[u8], bool) -> T,
     T: Debug,
 {
     trace!("try find header");
@@ -268,21 +286,19 @@ where
         let buf = ready!(Pin::new(&mut *io).poll_fill_buf(cx, force_append))?;
         force_append = true;
 
+        // println!("{:?}", std::str::from_utf8(&buf));
+
         // buffer did not grow. that means end_of_file in underlying reader.
-        if buf.len() == buf_index {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "EOF before complete http11 header",
-            ))
-            .into();
-        }
+        // we still however might have a possible header there with a
+        // redirect or some such.
+        let end_of_stream = buf.len() == buf_index;
 
         loop {
-            if end_index == END_OF_HEADER.len() {
-                // we found the end of the request/response header
+            if end_index == END_OF_HEADER.len() || end_of_stream {
+                // we might have found the end of the request/response header
 
                 // convert to whatever caller wants.
-                let ret = f(&buf[0..buf_index]);
+                let ret = f(&buf[0..buf_index], end_of_stream);
                 trace!("Parsed header: {:?}", ret);
 
                 // discard the amount used from buffer.

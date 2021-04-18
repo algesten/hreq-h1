@@ -58,6 +58,40 @@ where
     Ok(Connector(addr))
 }
 
+pub async fn serve_once<F, R>(mut f: F) -> Result<Connector, io::Error>
+where
+    F: Send + 'static,
+    F: FnMut(String, BufIo<TcpStream>) -> R,
+    R: Future<Output = Result<(), Error>>,
+    R: Send,
+{
+    setup_logger();
+
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let p = l.local_addr()?.port();
+
+    async_std::task::spawn(async move {
+        let (tcp, _) = l.accept().await.expect("Accept failed");
+        let mut brd = BufIo::with_capacity(16_384, tcp);
+
+        let head = match test_read_header(&mut brd).await {
+            Ok(v) => v,
+            Err(_e) => {
+                // client closed the connection
+                return;
+            }
+        };
+
+        let fut = f(head, brd);
+
+        fut.await.expect("Handler fail");
+    });
+
+    let addr = format!("127.0.0.1:{}", p);
+
+    Ok(Connector(addr))
+}
+
 pub struct Connector(pub String);
 
 impl Connector {
@@ -174,7 +208,9 @@ where
 
 pub async fn test_read_header<S: AsyncRead + Unpin>(io: &mut BufIo<S>) -> Result<String, Error> {
     Ok(poll_fn(|cx| {
-        hreq_h1::http11::poll_for_crlfcrlf(cx, io, |buf| String::from_utf8(buf.to_vec()).unwrap())
+        hreq_h1::http11::poll_for_crlfcrlf(cx, io, |buf, _| {
+            String::from_utf8(buf.to_vec()).unwrap()
+        })
     })
     .await?)
 }

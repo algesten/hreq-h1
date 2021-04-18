@@ -20,7 +20,7 @@ async fn client_get_200_ok() -> Result<(), Error> {
         let mut s_buf = BufIo::with_capacity(16_384, s);
 
         let req_s = poll_fn(|cx| {
-            poll_for_crlfcrlf(cx, &mut s_buf, |buf| {
+            poll_for_crlfcrlf(cx, &mut s_buf, |buf, _| {
                 String::from_utf8_lossy(buf).to_string()
             })
         })

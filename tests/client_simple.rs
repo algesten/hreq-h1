@@ -59,6 +59,33 @@ async fn request_200_no_cr() -> Result<(), Error> {
 }
 
 #[async_std::test]
+async fn request_301_drop_conn() -> Result<(), Error> {
+    let conn = common::serve_once(|head, mut tcp| async move {
+        assert_eq!(head, "GET /path HTTP/1.1\r\naccept: */*\r\n\r\n");
+
+        let res = b"HTTP/1.1 301\r\nlocation: /go-away";
+        tcp.write_all(res).await.unwrap();
+
+        let _ = tcp.close().await?;
+
+        Ok(())
+    })
+    .await?;
+
+    let req = http::Request::get("/path")
+        .header("accept", "*/*")
+        .body("")
+        .unwrap();
+
+    let (parts, _) = common::run(conn.connect().await?, req).await?;
+
+    assert_eq!(parts.status, 301);
+    assert_eq!(parts.headers.get_str("location"), Some(""));
+
+    Ok(())
+}
+
+#[async_std::test]
 async fn post_body() -> Result<(), Error> {
     let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(head, "POST /path HTTP/1.1\r\ncontent-length: 4\r\n\r\n");
