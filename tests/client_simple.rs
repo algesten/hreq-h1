@@ -32,6 +32,33 @@ async fn request_200_ok() -> Result<(), Error> {
 }
 
 #[async_std::test]
+async fn request_200_no_cr() -> Result<(), Error> {
+    let conn = common::serve(|head, mut tcp, _| async move {
+        assert_eq!(head, "GET /path HTTP/1.1\r\naccept: */*\r\n\r\n");
+
+        let res = b"HTTP/1.1 404 Not found\ncontent-length: 9\n\nNot found";
+        tcp.write_all(res).await.unwrap();
+
+        Ok((tcp, false))
+    })
+    .await?;
+
+    let req = http::Request::get("/path")
+        .header("accept", "*/*")
+        .body("")
+        .unwrap();
+
+    let (parts, body) = common::run(conn.connect().await?, req).await?;
+
+    assert_eq!(parts.status, 404);
+    assert_eq!(parts.headers.get_as("content-length"), Some(9));
+
+    assert_eq!(&body, &b"Not found");
+
+    Ok(())
+}
+
+#[async_std::test]
 async fn post_body() -> Result<(), Error> {
     let conn = common::serve(|head, mut tcp, _| async move {
         assert_eq!(head, "POST /path HTTP/1.1\r\ncontent-length: 4\r\n\r\n");

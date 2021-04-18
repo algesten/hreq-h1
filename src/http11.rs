@@ -306,6 +306,10 @@ where
 
             if buf[buf_index] == END_OF_HEADER[end_index] {
                 end_index += 1;
+            } else if end_index == 0 && buf[buf_index] == b'\n' {
+                // This might be a special case of \n\n instead of the
+                // correct \r\n\r\n. We still expect the last \n.
+                end_index = 3;
             } else if end_index > 0 {
                 end_index = 0;
             }
